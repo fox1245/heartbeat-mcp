@@ -16,7 +16,7 @@ bad = 0
 
 def check(name, condition, detail=""):
     global bad
-    print(("ok   " if condition else "FAIL ") + name + (f"  [{detail}]" if detail and not condition else ""))
+    print(("ok   " if condition else "FAIL ") + name + (f"  [{str(detail)[:300]}]" if not condition else ""))
     if not condition:
         bad += 1
 
@@ -29,7 +29,18 @@ def run(arguments, env, stdin=None):
 
 def hook(event, env, session, **extra):
     code, out, _ = run(["hook", event], env, stdin=json.dumps({"session_id": session, **extra}))
-    return code, json.loads(out)
+    return json.loads(out)
+
+
+def context(answer):
+    return answer.get("hookSpecificOutput", {}).get("additionalContext", "")
+
+
+def start_waiter(env, *arguments):
+    process = subprocess.Popen([sys.executable, "-I", PROGRAM, "wait", *arguments], env=env,
+                               stdout=subprocess.PIPE, text=True)
+    time.sleep(0.6)
+    return process
 
 
 with tempfile.TemporaryDirectory() as folder:
@@ -38,93 +49,181 @@ with tempfile.TemporaryDirectory() as folder:
     env = {"PATH": os.environ.get("PATH", ""), "HOME": folder, "HEARTBEAT_STATE_DIR": os.path.join(folder, "state"),
            "CLAUDE_CODE_SESSION_ID": session, "HEARTBEAT_WAIT_POLL_SEC": "1", "HEARTBEAT_NAG_SEC": "2",
            "HEARTBEAT_ARM_NAG_SEC": "2"}
+    state_file = os.path.join(folder, "state", f"{session}.json")
 
     # A session with no state: every hook answers {} and creates nothing.
-    code, answer = hook("PostToolUse", env, session)
-    check("hook without state answers {}", code == 0 and answer == {})
-    check("hook without state creates no file", not os.path.exists(os.path.join(folder, "state", f"{session}.json")))
+    check("hook without state answers {}", hook("PostToolUse", env, session) == {})
+    check("hook without state creates no file", not os.path.exists(state_file))
 
     # Caller errors.
-    code, _, err = run(["set", "--in", "soon", "--label", "x"], env)
+    code, _, err = run(["open", "a", "--label", "x", "--in", "soon"], env)
     check("a bad duration is refused", code == 2 and "not a duration" in err, err)
     code, _, err = run(["--session", "not-a-uuid", "list"], env)
     check("a session id that is not a UUID is refused", code == 2 and "UUID" in err, err)
-    code, _, err = run(["done", "nope"], env)
-    check("an unknown beat id is refused", code == 2 and "no beat" in err, err)
+    code, _, err = run(["close", "nope"], env)
+    check("an unknown channel is refused", code == 2 and "no open channel" in err, err)
+    code, _, err = run(["open", "two words", "--label", "x", "--in", "1m"], env)
+    check("a channel name with a space is refused", code == 2 and "channel name" in err, err)
+    code, _, err = run(["open", "a", "--label", "x"], env)
+    check("a channel without a deadline or an interval is refused", code == 2 and "deadline" in err, err)
 
-    # A pending beat, not overdue.
-    code, out, _ = run(["set", "--in", "3s", "--label", "first job", "--check", "look at /tmp/x"], env)
-    beat_id = out.split()[1]
-    check("set prints the id and how to arm the waiter", code == 0 and "wait" in out, out)
-    code, answer = hook("Stop", env, session)
-    check("Stop is blocked while a beat is pending and no waiter runs",
-          answer.get("decision") == "block" and "no waiter" in answer.get("reason", ""), str(answer))
-    code, answer = hook("Stop", env, session, stop_hook_active=True)
-    check("Stop is not blocked a second time in one continuation", answer == {}, str(answer))
-    code, answer = hook("PostToolUse", env, session)
-    context = answer.get("hookSpecificOutput", {}).get("additionalContext", "")
-    check("a tool result reminds that no waiter runs", "no waiter" in context, str(answer))
+    # Two channels: A is due soon and has a notation, B is far away and has none (the notation is optional).
+    code, out, _ = run(["open", "A", "--label", "first job", "--in", "3s", "--notation", "read /tmp/x, then merge"], env)
+    check("open prints the channel, its notation and how to start a waiter",
+          code == 0 and "[A] first job" in out and "to do: read /tmp/x, then merge" in out and "wait" in out, out)
+    code, out, _ = run(["open", "B", "--label", "second job", "--in", "1h"], env)
+    check("a channel without a notation shows none", code == 0 and "to do:" not in out, out)
+    code, _, err = run(["open", "A", "--label", "again", "--in", "1m"], env)
+    check("an open channel's name cannot be opened again", code == 2 and "already open" in err, err)
+    answer = hook("Stop", env, session)
+    check("Stop is blocked while open channels are not watched",
+          answer.get("decision") == "block" and "not watched" in answer.get("reason", "") and
+          "A" in answer["reason"] and "B" in answer["reason"], answer)
+    check("Stop is not blocked a second time in one continuation",
+          hook("Stop", env, session, stop_hook_active=True) == {})
+    answer = hook("PostToolUse", env, session)
+    check("a tool result reminds that channels are not watched", "not watched" in context(answer), answer)
     check("the hook names its event", answer.get("hookSpecificOutput", {}).get("hookEventName") == "PostToolUse")
-    code, answer = hook("PostToolUse", env, session)
-    check("the waiter reminder is rate-limited", answer == {}, str(answer))
-    code, answer = hook("PostToolUse", env, other)
-    check("another session sees nothing", answer == {}, str(answer))
+    check("the reminder is rate-limited", hook("PostToolUse", env, session) == {})
+    check("another session sees nothing", hook("PostToolUse", env, other) == {})
 
     # A recorded waiter that is not this program waiting does not count: a live pid of another program, a dead pid.
-    state_file = os.path.join(folder, "state", f"{session}.json")
     for label, pid in (("another program's pid", os.getpid()), ("a dead pid", 2 ** 22 + 12345)):
         with open(state_file) as handle:
             stored = json.load(handle)
-        stored["waiter"] = {"pid": pid, "started": time.time()}
+        stored["waiters"] = [{"pid": pid, "started": time.time(), "channels": None}]
         with open(state_file, "w") as handle:
             json.dump(stored, handle)
-        code, answer = hook("Stop", env, session)
-        check(f"a recorded waiter that is {label} does not count as running",
-              answer.get("decision") == "block" and "no waiter" in answer.get("reason", ""), str(answer))
+        answer = hook("Stop", env, session)
+        check(f"a recorded waiter that is {label} does not count",
+              answer.get("decision") == "block" and "not watched" in answer.get("reason", ""), answer)
         code, out, _ = run(["list"], env)
-        check(f"list shows the waiter as not running for {label}", "waiter: not running" in out, out)
+        check(f"list shows the channels as not covered for {label}", "NOT covered" in out, out)
 
-    # The waiter: alive while pending, exits at the deadline and names the beat.
-    waiter = subprocess.Popen([sys.executable, "-I", PROGRAM, "wait"], env=env, stdout=subprocess.PIPE, text=True)
-    time.sleep(0.6)
-    code, answer = hook("Stop", env, session)
-    check("Stop passes while the waiter runs and nothing is overdue", answer == {}, str(answer))
+    # A waiter for named channels covers only those; a waiter without names covers all.
+    partial = start_waiter(env, "--channel", "B")
+    answer = hook("Stop", env, session)
+    check("a waiter for B alone leaves A unwatched",
+          answer.get("decision") == "block" and "(A)" in answer.get("reason", ""), answer)
+    code, _, err = run(["wait", "--channel", "nope"], env)
+    check("a waiter for an unknown channel is refused", code == 2 and "no open channel" in err, err)
+    waiter = start_waiter(env)
+    check("Stop passes while a waiter watches every channel and nothing fired", hook("Stop", env, session) == {})
     code, out, _ = run(["list"], env)
-    check("list shows the beat and the running waiter", "first job" in out and "waiter: running" in out, out)
+    check("list shows both channels as covered",
+          "first job" in out and "second job" in out and "cover every open channel" in out, out)
     started = time.time()
     output, _ = waiter.communicate(timeout=20)
-    check("the waiter exits at the deadline", waiter.returncode == 0 and time.time() - started < 8)
-    check("the waiter names the overdue beat and its check", "first job" in output and "look at /tmp/x" in output,
-          output)
+    check("the waiter exits when A's deadline passes", waiter.returncode == 0 and time.time() - started < 8)
+    check("the waiter names the fired channel with its notation, and the quiet one",
+          "[A] first job" in output and "OVERDUE" in output and "to do: read /tmp/x, then merge" in output and
+          "quiet: [B] second job" in output, output)
+    check("the waiter for B alone is still waiting", partial.poll() is None)
 
     # Overdue.
-    code, answer = hook("Stop", env, session)
-    check("Stop is blocked while a beat is overdue",
-          answer.get("decision") == "block" and "overdue" in answer.get("reason", "") and beat_id in answer["reason"],
-          str(answer))
-    code, answer = hook("UserPromptSubmit", env, session)
-    context = answer.get("hookSpecificOutput", {}).get("additionalContext", "")
-    check("a prompt carries the overdue beat", "overdue" in context and "first job" in context, str(answer))
-    code, answer = hook("PostToolUse", env, session)
-    check("the overdue reminder is rate-limited", answer == {}, str(answer))
+    answer = hook("Stop", env, session)
+    check("Stop is blocked while a channel fired, with the notation",
+          answer.get("decision") == "block" and "[A]" in answer.get("reason", "") and
+          "to do: read /tmp/x" in answer["reason"], answer)
+    answer = hook("UserPromptSubmit", env, session)
+    check("a prompt carries the fired channel", "OVERDUE" in context(answer) and "first job" in context(answer), answer)
+    check("the fired reminder is rate-limited", hook("PostToolUse", env, session) == {})
     time.sleep(2.2)
-    code, answer = hook("PostToolUse", env, session)
-    check("the overdue reminder repeats after the interval",
-          "overdue" in answer.get("hookSpecificOutput", {}).get("additionalContext", ""), str(answer))
+    check("the fired reminder repeats after the interval", "OVERDUE" in context(hook("PostToolUse", env, session)))
     code, out, _ = run(["wait"], env)
-    check("a waiter started while a beat is overdue returns at once", code == 0 and "overdue" in out, out)
+    check("a waiter started while a channel fired returns at once", code == 0 and "[A]" in out, out)
+    code, out, _ = run(["extend", "A", "--in", "1h"], env)
+    check("extend gives a new deadline", code == 0 and "extended" in out and "OVERDUE" not in out, out)
+    check("an extended channel does not fire", "OVERDUE" not in json.dumps(hook("UserPromptSubmit", env, session)))
 
-    # Extend, then done.
-    code, out, _ = run(["extend", beat_id, "--in", "1h"], env)
-    check("extend moves the deadline", code == 0 and "extended" in out, out)
-    code, answer = hook("UserPromptSubmit", env, session)
-    check("an extended beat is not overdue", "overdue" not in json.dumps(answer), str(answer))
-    code, out, _ = run(["done", beat_id], env)
-    check("done finishes the beat", code == 0 and "done" in out, out)
-    code, answer = hook("Stop", env, session)
-    check("Stop passes with no pending beat", answer == {}, str(answer))
+    # The thing waited for speaks: a note fires the channel until it is acknowledged.
+    code, out, _ = run(["note", "B", "--text", "needs a decision"], env)
+    output, _ = partial.communicate(timeout=20)
+    check("a note wakes the waiter of that channel",
+          partial.returncode == 0 and "[B]" in output and "NOTE" in output and "needs a decision" in output, output)
+    check("a noted channel blocks Stop", hook("Stop", env, session).get("decision") == "block")
+    code, out, _ = run(["ack", "B"], env)
+    check("ack clears the notes and keeps the channel open", code == 0 and "NOTE" not in out and "due" in out, out)
+
+    # ... and finish fires it until it is closed.
+    waiter = start_waiter(env)
+    code, out, _ = run(["finish", "B", "--text", "VERIFY: PASS"], env)
+    output, _ = waiter.communicate(timeout=20)
+    check("finish wakes the waiter with the text", "FINISHED: VERIFY: PASS" in output and "[B]" in output, output)
+    check("a finished channel is not also overdue", "OVERDUE" not in output.split("quiet:")[0], output)
+    code, out, _ = run(["close", "B"], env)
+    check("close ends the channel", code == 0 and "closed [B]" in out, out)
+    code, out, _ = run(["list"], env)
+    check("a closed channel is not listed", "second job" not in out and "first job" in out, out)
+    code, out, _ = run(["open", "B", "--label", "second job, again", "--in", "1h"], env)
+    check("a closed channel's name can be opened again", code == 0, out)
+
+    # A liveness interval: every beat moves the deadline; silence longer than the interval fires.
+    run(["open", "L", "--label", "alive job", "--every", "2s"], env)
+    time.sleep(1.2)
+    code, out, _ = run(["beat", "L", "--text", "step 3"], env)
+    check("a beat is recorded", code == 0 and "last sign of life" in out and "(1 so far)" in out, out)
+    time.sleep(1.2)
+    check("a beat moved the deadline", "[L]" not in json.dumps(hook("Stop", env, session)))
+    time.sleep(2.2)
+    answer = hook("Stop", env, session)
+    check("silence longer than the interval fires", "[L]" in answer.get("reason", "") and "OVERDUE" in answer["reason"],
+          answer)
+    run(["close", "L"], env)
+
+    # A channel bound to a subagent: that agent's tool calls are signs of life, and the agent gets no reminders.
+    run(["open", "G", "--label", "subagent", "--every", "2s", "--agent", "agent-1"], env)
+    time.sleep(1.3)
+    check("a subagent's tool call gets no reminder", hook("PostToolUse", env, session, agent_id="agent-1") == {})
+    time.sleep(1.3)
+    code, out, _ = run(["list"], env)
+    check("the bound agent's tool call moved the deadline",
+          "[G] subagent" in out and "(1 so far)" in out and "OVERDUE" not in out.split("[G]")[1].split("\n")[0], out)
+    check("another subagent's tool call is not a sign of life",
+          hook("PostToolUse", env, session, agent_id="agent-2") == {} and
+          "(1 so far)" in run(["list"], env)[1])
+    time.sleep(2.2)
+    check("a fired channel is not reported into a subagent's context",
+          hook("PostToolUse", env, session, agent_id="agent-2") == {})
+    check("a silent bound agent fires its channel", "[G]" in hook("Stop", env, session).get("reason", ""))
+    run(["close", "G"], env)
+
+    # The notation can be set and cleared later.
+    code, out, _ = run(["notate", "A", "--text", "rebase, gate, push"], env)
+    check("notate sets the notation", "to do: rebase, gate, push" in out, out)
+    code, out, _ = run(["notate", "A"], env)
+    check("notate without text clears it", "to do:" not in out, out)
+
+    # Many channels at once.
+    for index in range(40):
+        run(["open", f"c{index}", "--label", f"job {index}", "--in", "1h"], env)
+    code, out, _ = run(["list"], env)
+    check("forty more channels are open at once", all(f"[c{index}]" in out for index in range(40)), out[:200])
+    waiter = start_waiter(env)
+    check("one waiter covers all of them", hook("Stop", env, session) == {})
+    run(["finish", "c17"], env)
+    output, _ = waiter.communicate(timeout=20)
+    check("the waiter names exactly the channel that fired",
+          "1 channel(s) fired" in output and "[c17]" in output.split("quiet:")[0], output[:300])
+    for index in range(40):
+        run(["close", f"c{index}"], env)
+    for name in ("A", "B"):
+        run(["close", name], env)
+    check("Stop passes with no open channel", hook("Stop", env, session) == {})
     code, out, _ = run(["wait"], env)
-    check("the waiter has nothing to wait for", code == 0 and "no pending beats" in out, out)
+    check("a waiter has nothing to wait for", code == 0 and "no open channel" in out, out)
+
+    # State written by version 0.1 is carried over.
+    with open(state_file, "w") as handle:
+        json.dump({"beats": [{"id": "abc123", "label": "old beat", "check": "old check", "created": time.time(),
+                              "due": time.time() + 600, "status": "pending", "last_nag": 0.0},
+                             {"id": "def456", "label": "old done", "check": "", "created": 0, "due": 0,
+                              "status": "done"}],
+                   "waiter": None, "last_arm_nag": 0.0}, handle)
+    code, out, _ = run(["list"], env)
+    check("a pending beat of the old format becomes a channel with its check as the notation",
+          "[abc123] old beat" in out and "to do: old check" in out and "old done" not in out, out)
+    run(["close", "abc123"], env)
 
     # A hook never fails the host: bad input.
     done = subprocess.run([sys.executable, "-I", PROGRAM, "hook", "Stop"], input="not json", env=env,
@@ -132,28 +231,49 @@ with tempfile.TemporaryDirectory() as folder:
     check("bad hook input answers {}", done.returncode == 0 and json.loads(done.stdout) == {})
 
     # The MCP server.
+    def call(identifier, tool, **arguments):
+        return {"jsonrpc": "2.0", "id": identifier, "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments}}
     requests = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-         "params": {"name": "heartbeat_set", "arguments": {"label": "mcp job", "minutes": 30, "check": "agent x"}}},
-        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "heartbeat_list", "arguments": {}}},
-        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "heartbeat_done", "arguments": {"id": "zz"}}},
-        {"jsonrpc": "2.0", "id": 6, "method": "nope"},
+        call(3, "heartbeat_open", name="m1", label="mcp job", minutes=30, notation="check agent x"),
+        call(4, "heartbeat_open", label="unnamed, by interval", every_minutes=10, notation=None),
+        call(5, "heartbeat_note", name="m1", text="look"),
+        call(6, "heartbeat_list"),
+        call(7, "heartbeat_ack", name="m1"),
+        call(8, "heartbeat_finish", name="m1", text="done ok"),
+        call(9, "heartbeat_extend", name="m1", minutes=5),
+        call(10, "heartbeat_notate", name="m1", notation=None),
+        call(11, "heartbeat_close", name="m1"),
+        call(12, "heartbeat_close", name="zz"),
+        call(13, "heartbeat_open", label="no time"),
+        {"jsonrpc": "2.0", "id": 14, "method": "nope"},
     ]
     code, out, _ = run(["mcp"], env, stdin="\n".join(json.dumps(r) for r in requests) + "\n")
     replies = {reply["id"]: reply for reply in map(json.loads, out.splitlines())}
-    check("the server answers every request and no notification", sorted(replies) == [1, 2, 3, 4, 5, 6], out)
+    text = {key: reply["result"]["content"][0]["text"] for key, reply in replies.items()
+            if "result" in reply and "content" in reply["result"]}
+    check("the server answers every request and no notification", sorted(replies) == list(range(1, 15)), out[:200])
     check("initialize echoes the protocol version and declares tools",
           replies[1]["result"]["protocolVersion"] == "2025-06-18" and "tools" in replies[1]["result"]["capabilities"])
-    check("four tools are listed", [t["name"] for t in replies[2]["result"]["tools"]] ==
-          ["heartbeat_set", "heartbeat_done", "heartbeat_extend", "heartbeat_list"])
-    check("heartbeat_set sets a beat and says how to arm the waiter",
-          not replies[3]["result"]["isError"] and "wait" in replies[3]["result"]["content"][0]["text"])
-    check("heartbeat_list shows it", "mcp job" in replies[4]["result"]["content"][0]["text"])
-    check("a tool error is a tool result, not a protocol error", replies[5]["result"]["isError"] is True)
-    check("an unknown method is a protocol error", replies[6]["error"]["code"] == -32601)
+    check("nine tools are listed", [tool["name"] for tool in replies[2]["result"]["tools"]] ==
+          ["heartbeat_open", "heartbeat_beat", "heartbeat_note", "heartbeat_finish", "heartbeat_extend",
+           "heartbeat_ack", "heartbeat_notate", "heartbeat_close", "heartbeat_list"])
+    check("heartbeat_open opens a channel with its notation and says how to start a waiter",
+          "[m1] mcp job" in text[3] and "to do: check agent x" in text[3] and "wait" in text[3], text[3])
+    check("heartbeat_open takes an interval, no name and a null notation",
+          not replies[4]["result"]["isError"] and "to do:" not in text[4], text[4])
+    check("heartbeat_list shows the note", "[m1]" in text[6] and "NOTE" in text[6] and "look" in text[6], text[6])
+    check("heartbeat_ack clears it", "NOTE" not in text[7], text[7])
+    check("heartbeat_finish reports the text", "FINISHED: done ok" in text[8], text[8])
+    check("heartbeat_extend reopens the channel", "FINISHED" not in text[9] and "due" in text[9], text[9])
+    check("heartbeat_notate with null clears the notation", "to do:" not in text[10], text[10])
+    check("heartbeat_close closes it", "closed [m1]" in text[11], text[11])
+    check("a tool error is a tool result, not a protocol error", replies[12]["result"]["isError"] is True)
+    check("a channel without any time is a tool error", replies[13]["result"]["isError"] is True, text[13])
+    check("an unknown method is a protocol error", replies[14]["error"]["code"] == -32601)
 
     # The session is found through an ancestor's session file when the environment does not name it.
     bare = dict(env)
@@ -162,7 +282,7 @@ with tempfile.TemporaryDirectory() as folder:
     with open(os.path.join(folder, ".claude", "sessions", f"{os.getpid()}.json"), "w") as handle:
         json.dump({"sessionId": session}, handle)
     code, out, _ = run(["list"], bare)
-    check("the session is found from the ancestor's session file", code == 0 and "mcp job" in out, out)
+    check("the session is found from the ancestor's session file", code == 0 and "unnamed, by interval" in out, out)
 
 print(f"bad={bad}")
 sys.exit(0 if bad == 0 else 1)
