@@ -1,4 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160" role="img" aria-label="Heartbeat">
-  <rect x="8" y="8" width="144" height="144" rx="32" ry="32" fill="#1f2937"/>
-  <polyline points="22,84 54,84 66,50 84,118 98,66 106,84 138,84" fill="none" stroke="#34d399" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="t">
+  <title id="t">heartbeat-mcp</title>
+  <rect x="2" y="2" width="252" height="252" rx="54" fill="#0f172a" stroke="#334155" stroke-width="4"/>
+  <circle cx="128" cy="128" r="76" fill="none" stroke="#e2e8f0" stroke-width="10" stroke-linecap="round"
+          stroke-dasharray="190.76 48" stroke-dashoffset="-24"/>
+  <polyline points="28,128 86,128 101,104 120,172 144,74 163,148 175,128 228,128" fill="none" stroke="#fb7185"
+            stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
