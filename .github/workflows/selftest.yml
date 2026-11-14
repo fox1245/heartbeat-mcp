@@ -10,23 +10,16 @@ permissions:
 jobs:
   selftest:
     name: python ${{ matrix.python }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # setup-python has no builds of 3.8 and 3.9 for the newest runner images.
-          - { os: ubuntu-22.04, python: "3.8" }
-          - { os: ubuntu-22.04, python: "3.9" }
-          - { os: ubuntu-latest, python: "3.10" }
-          - { os: ubuntu-latest, python: "3.11" }
-          - { os: ubuntu-latest, python: "3.12" }
-          - { os: ubuntu-latest, python: "3.13" }
-          - { os: ubuntu-latest, python: "3.14" }
+        # setup-python has builds of 3.8 and 3.9 only for images up to Ubuntu 24.04, which ubuntu-latest is at present.
+        python: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: Self-test
