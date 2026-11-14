@@ -25,6 +25,7 @@ import fcntl
 import json
 import os
 import secrets
+import shlex
 import sys
 import time
 import uuid
@@ -50,6 +51,7 @@ WAIT_POLL_SEC = _setting("HEARTBEAT_WAIT_POLL_SEC", 15.0)     # a waiter re-read
 NAME_MAX = 64
 UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0}
 SELF = os.path.realpath(__file__)
+COMMAND = f"python3 -I {shlex.quote(SELF)}"       # how this program is started in every hint it prints
 
 OPEN, FINISHED, CLOSED = "open", "finished", "closed"
 
@@ -83,7 +85,7 @@ def resolve_session(explicit: str | None = None) -> str:
             if pid <= 1:
                 break
     if not sid:
-        raise HeartbeatError("no session id: set CLAUDE_CODE_SESSION_ID or pass --session")
+        raise HeartbeatError("no session id: set CLAUDE_CODE_SESSION_ID (the command line also takes --session)")
     try:
         return str(uuid.UUID(sid))          # also keeps the id safe as a file name
     except ValueError as error:
@@ -150,6 +152,22 @@ def clock(moment: float) -> str:
     return datetime.datetime.fromtimestamp(moment).strftime("%H:%M:%S")
 
 
+def span(seconds: float) -> str:
+    """A length of time for a message: seconds below a minute, whole minutes above."""
+    return f"{int(seconds)} s" if seconds < 60 else f"{int(seconds // 60)} min"
+
+
+def deadline_after(now: float, seconds: float) -> float:
+    """now + seconds, refused when the result is not a time that can be shown (nan, infinity, beyond the calendar):
+    such a value would be stored and then break every later listing."""
+    due = now + seconds
+    try:
+        clock(due)
+    except (ValueError, OverflowError, OSError):
+        raise HeartbeatError(f"{seconds!r} seconds from now is not a time that can be represented") from None
+    return due
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Channels
 # ---------------------------------------------------------------------------------------------------------------------
@@ -194,9 +212,10 @@ def describe(channel: dict, now: float) -> str:
     for note in channel["notes"]:
         parts.append(f"NOTE {clock(note['t'])}: {note['text']}")
     if channel.get("interval"):
-        parts.append(f"expects a sign of life every {int(channel['interval'] // 60)} min")
+        parts.append(f"expects a sign of life every {span(channel['interval'])}")
     if channel.get("last_beat"):
-        parts.append(f"last sign of life {clock(channel['last_beat'])} ({channel['beats']} so far)")
+        parts.append(f"last sign of life {clock(channel['last_beat'])} ({channel['beats']} so far)" +
+                     (f": {channel['last_text']}" if channel.get("last_text") else ""))
     elif channel.get("interval") or channel.get("agent"):
         parts.append("no sign of life yet")
     text = f"[{channel['name']}] {channel['label']} ({'; '.join(parts)})"
@@ -209,10 +228,13 @@ def _is_waiter(waiter: dict) -> bool:
     """Whether a recorded waiter is still this program waiting (a reused pid of another program does not count)."""
     try:
         with open(f"/proc/{waiter['pid']}/cmdline", "rb") as handle:
-            arguments = handle.read().split(b"\0")
+            arguments = [os.fsdecode(argument) for argument in handle.read().split(b"\0")]
+        directory = os.readlink(f"/proc/{waiter['pid']}/cwd")
     except (OSError, KeyError):
         return False
-    return SELF.encode() in arguments and b"wait" in arguments
+    # The program may have been started by a relative path or through a symbolic link.
+    return "wait" in arguments and any(
+        os.path.realpath(os.path.join(directory, argument)) == SELF for argument in arguments if argument)
 
 
 def uncovered(data: dict) -> list[dict]:
@@ -229,7 +251,7 @@ def uncovered(data: dict) -> list[dict]:
 # ---------------------------------------------------------------------------------------------------------------------
 
 ARM_HINT = (f"Start a waiter as a background command so an idle session is woken when a channel fires: "
-            f"python3 -I {SELF} wait")
+            f"{COMMAND} wait")
 
 
 def _get(data: dict, name: str) -> dict:
@@ -247,12 +269,15 @@ def op_open(sid: str, name: str | None, label: str, seconds: float | None, every
         raise HeartbeatError("a channel needs a deadline (--in) or a liveness interval (--every)")
     name = check_name(name) if name else secrets.token_hex(3)
     now = time.time()
+    due = deadline_after(now, seconds if seconds is not None else every)
+    if every is not None:
+        deadline_after(now, every)
     with state(sid) as data:
         existing = data["channels"].get(name)
         if existing is not None and existing["status"] != CLOSED:
             raise HeartbeatError(f"channel {name!r} is already open")
         data["channels"][name] = new_channel(name, label.strip(), (notation or "").strip() or None,
-                                             now + (seconds if seconds is not None else every), every,
+                                             due, every,
                                              (agent or "").strip() or None)
         return {"channel": dict(data["channels"][name]), "covered": not uncovered(data)}
 
@@ -267,8 +292,7 @@ def op_beat(sid: str, name: str, text: str | None = None) -> dict:
         if channel["status"] == OPEN and channel.get("interval"):
             channel["due"] = now + channel["interval"]
             channel["last_nag"] = 0.0
-        if text:
-            channel["last_text"] = text.strip()
+        channel["last_text"] = (text or "").strip() or None
         return dict(channel)
 
 
@@ -299,7 +323,7 @@ def op_extend(sid: str, name: str, seconds: float) -> dict:
     with state(sid) as data:
         channel = _get(data, name)
         channel["status"] = OPEN
-        channel["due"] = time.time() + seconds
+        channel["due"] = deadline_after(time.time(), seconds)
         channel["notes"] = []
         channel["finish_text"] = None
         channel["last_nag"] = 0.0
@@ -423,7 +447,7 @@ def hook_answer(event: str, payload: dict) -> dict:
                 return {"decision": "block",
                         "reason": "Heartbeat: channels fired. Look at each one now (read the work's own output, "
                                   "resume or stop its agent), then close it, extend it or acknowledge its notes:\n"
-                                  f"{listing}\n(python3 -I {SELF} close <name> | extend <name> --in <time> | "
+                                  f"{listing}\n({COMMAND} close <name> | extend <name> --in <time> | "
                                   "ack <name>)"}
             if bare:
                 return {"decision": "block",
@@ -520,19 +544,30 @@ def _minutes(arguments: dict, key: str) -> float | None:
     return seconds
 
 
+def _required(arguments: dict, key: str) -> str:
+    value = arguments.get(key)
+    if value is None:
+        raise HeartbeatError(f"missing argument {key!r}")
+    return str(value)
+
+
 def call_tool(name: str, arguments: dict) -> str:
+    if name not in {tool["name"] for tool in TOOLS}:
+        raise HeartbeatError(f"unknown tool {name!r}")
     sid = resolve_session()
     now = time.time()
     if name == "heartbeat_open":
-        result = op_open(sid, arguments.get("name"), str(arguments["label"]), _minutes(arguments, "minutes"),
+        result = op_open(sid, arguments.get("name"), _required(arguments, "label"), _minutes(arguments, "minutes"),
                          _minutes(arguments, "every_minutes"), arguments.get("notation"), arguments.get("agent"))
         text = "opened " + describe(result["channel"], now)
         return text if result["covered"] else f"{text}\n{ARM_HINT}"
-    channel_name = str(arguments.get("name", ""))
+    if name == "heartbeat_list":
+        return render_list(op_list(sid))
+    channel_name = _required(arguments, "name")
     if name == "heartbeat_beat":
         return "beat on " + describe(op_beat(sid, channel_name, arguments.get("text")), now)
     if name == "heartbeat_note":
-        return "noted on " + describe(op_note(sid, channel_name, str(arguments["text"])), now)
+        return "noted on " + describe(op_note(sid, channel_name, _required(arguments, "text")), now)
     if name == "heartbeat_finish":
         return "finished " + describe(op_finish(sid, channel_name, arguments.get("text")), now)
     if name == "heartbeat_extend":
@@ -547,9 +582,7 @@ def call_tool(name: str, arguments: dict) -> str:
     if name == "heartbeat_close":
         channel = op_close(sid, channel_name)
         return f"closed [{channel['name']}] {channel['label']}"
-    if name == "heartbeat_list":
-        return render_list(op_list(sid))
-    raise HeartbeatError(f"unknown tool {name!r}")
+    raise HeartbeatError(f"unknown tool {name!r}")              # not reached: every listed tool is handled above
 
 
 def mcp_reply(request: dict) -> dict | None:
@@ -608,31 +641,35 @@ def main(argv: list[str]) -> int:
 
     opener = commands.add_parser("open", help="open a channel for one thing you wait for")
     opener.add_argument("name", nargs="?", help="a short name without spaces (generated when omitted)")
-    opener.add_argument("--label", required=True)
+    opener.add_argument("--label", required=True, help="what is running, in a few words")
     opener.add_argument("--in", dest="duration", help="expected time until it is finished: 90s, 40m, 2h, or minutes")
-    opener.add_argument("--every", help="longest silence allowed between signs of life")
+    opener.add_argument("--every", help="longest silence allowed between signs of life (same formats as --in); each "
+                        "beat moves the deadline this far ahead")
     opener.add_argument("--notation", "--check", dest="notation", default=None,
                         help="what to do when the channel fires")
     opener.add_argument("--agent", default=None, help="a subagent id whose tool calls count as signs of life")
-    for verb, text in (("beat", "a sign of life, from the thing waited for"),
-                       ("finish", "the thing waited for is done"),
-                       ("note", "the thing waited for asks for attention")):
+    for verb, text, text_help in (
+            ("beat", "a sign of life, from the thing waited for", "progress message, shown with the last sign of life"),
+            ("finish", "the thing waited for is done", "result message, shown when the channel is reported"),
+            ("note", "the thing waited for asks for attention", "the message, shown until the notes are acknowledged")):
         sub = commands.add_parser(verb, help=text)
-        sub.add_argument("name")
-        sub.add_argument("--text", default=None, required=(verb == "note"))
+        sub.add_argument("name", help="the channel's name")
+        sub.add_argument("--text", default=None, required=(verb == "note"), help=text_help)
     extend = commands.add_parser("extend", help="you looked and the work goes on: a new deadline")
-    extend.add_argument("name")
-    extend.add_argument("--in", dest="duration", required=True)
-    commands.add_parser("ack", help="acknowledge a channel's notes").add_argument("name")
+    extend.add_argument("name", help="the channel's name")
+    extend.add_argument("--in", dest="duration", required=True,
+                        help="new deadline, counted from now: 90s, 40m, 2h, or minutes")
+    commands.add_parser("ack", help="acknowledge a channel's notes").add_argument("name", help="the channel's name")
     notate = commands.add_parser("notate", help="set or clear what to do when the channel fires")
-    notate.add_argument("name")
+    notate.add_argument("name", help="the channel's name")
     notate.add_argument("--text", default=None, help="omit to clear the notation")
-    commands.add_parser("close", aliases=["done"], help="close a channel after you looked").add_argument("name")
+    commands.add_parser("close", aliases=["done"], help="close a channel after you looked").add_argument(
+        "name", help="the channel's name")
     commands.add_parser("list", help="open channels and whether waiters cover them")
     waiter = commands.add_parser("wait", help="block until a channel fires (run it in the background)")
     waiter.add_argument("--channel", action="append", default=None, help="watch only this channel (repeatable)")
     hook = commands.add_parser("hook", help="hook entry: JSON on stdin, JSON on stdout")
-    hook.add_argument("event")
+    hook.add_argument("event", help="the harness's hook event: PostToolUse, UserPromptSubmit or Stop")
     commands.add_parser("mcp", help="MCP server on stdio")
     arguments = parser.parse_args(argv)
 

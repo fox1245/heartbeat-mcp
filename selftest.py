@@ -162,7 +162,9 @@ with tempfile.TemporaryDirectory() as folder:
     run(["open", "L", "--label", "alive job", "--every", "2s"], env)
     time.sleep(1.2)
     code, out, _ = run(["beat", "L", "--text", "step 3"], env)
-    check("a beat is recorded", code == 0 and "last sign of life" in out and "(1 so far)" in out, out)
+    check("a beat is recorded with its text", code == 0 and "last sign of life" in out and "(1 so far): step 3" in out, out)
+    code, out, _ = run(["beat", "L"], env)
+    check("a beat without text clears the previous text", "(2 so far)" in out and "step 3" not in out, out)
     time.sleep(1.2)
     check("a beat moved the deadline", "[L]" not in json.dumps(hook("Stop", env, session)))
     time.sleep(2.2)
@@ -213,6 +215,51 @@ with tempfile.TemporaryDirectory() as folder:
     code, out, _ = run(["wait"], env)
     check("a waiter has nothing to wait for", code == 0 and "no open channel" in out, out)
 
+    # A deadline that cannot be shown is refused before anything is stored (it would break every later listing).
+    for bad_time in ("nan", "inf", "1e300h"):
+        code, _, err = run(["open", "t", "--label", "x", "--in", bad_time], env)
+        check(f"a deadline of {bad_time} is refused", code == 2 and "not a time that can be represented" in err, err)
+    code, out, _ = run(["list"], env)
+    check("a refused deadline stored nothing", code == 0 and out == "no open channels", out)
+    run(["open", "t", "--label", "x", "--in", "1h"], env)
+    code, _, err = run(["extend", "t", "--in", "nan"], env)
+    check("extend refuses a deadline that cannot be shown", code == 2 and "represented" in err, err)
+    code, out, _ = run(["list"], env)
+    check("the channel is intact after the refused extend", code == 0 and "[t] x" in out, out)
+    run(["close", "t"], env)
+
+    # A liveness interval below a minute is shown in seconds, not as "0 min".
+    code, out, _ = run(["open", "s30", "--label", "short", "--every", "30s"], env)
+    check("an interval of 30 seconds is shown as 30 s", "every 30 s" in out and "every 0 min" not in out, out)
+    run(["close", "s30"], env)
+
+    # The waiter is recognised however it was started: a relative path, a symbolic link, a path with a space.
+    run(["open", "R", "--label", "relative", "--in", "1h"], env)
+    started = []
+    link = os.path.join(folder, "hb-link.py")
+    os.symlink(PROGRAM, link)
+    for label, command, directory in (("a relative path", [sys.executable, "-I", "heartbeat.py", "wait"], HERE),
+                                      ("a symbolic link", [sys.executable, "-I", link, "wait"], folder)):
+        process = subprocess.Popen(command, env=env, cwd=directory, stdout=subprocess.PIPE, text=True)
+        started.append(process)
+        time.sleep(0.6)
+        check(f"a waiter started by {label} is recognised", hook("Stop", env, session) == {})
+        process.terminate()
+        process.communicate(timeout=10)
+        check(f"a waiter that ended is not counted ({label})", hook("Stop", env, session).get("decision") == "block")
+    run(["close", "R"], env)
+
+    spaced = os.path.join(folder, "with space")
+    os.makedirs(spaced)
+    copy = os.path.join(spaced, "heartbeat.py")
+    with open(PROGRAM) as source, open(copy, "w") as target:
+        target.write(source.read())
+    done = subprocess.run([sys.executable, "-I", copy, "open", "Q", "--label", "x", "--in", "1h"], env=env,
+                          capture_output=True, text=True, timeout=30)
+    check("the hint quotes a program path that contains a space",
+          f"python3 -I '{os.path.realpath(copy)}' wait" in done.stdout, done.stdout)
+    run(["close", "Q"], env)
+
     # State written by version 0.1 is carried over.
     with open(state_file, "w") as handle:
         json.dump({"beats": [{"id": "abc123", "label": "old beat", "check": "old check", "created": time.time(),
@@ -250,12 +297,16 @@ with tempfile.TemporaryDirectory() as folder:
         call(12, "heartbeat_close", name="zz"),
         call(13, "heartbeat_open", label="no time"),
         {"jsonrpc": "2.0", "id": 14, "method": "nope"},
+        call(15, "heartbeat_note", name="zz"),
+        call(16, "heartbeat_beat"),
+        call(17, "heartbeat_open", label="nan", minutes=float("nan")),
+        {"jsonrpc": "2.0", "id": 18, "method": "tools/call", "params": {"name": "heartbeat_nope", "arguments": {}}},
     ]
     code, out, _ = run(["mcp"], env, stdin="\n".join(json.dumps(r) for r in requests) + "\n")
     replies = {reply["id"]: reply for reply in map(json.loads, out.splitlines())}
     text = {key: reply["result"]["content"][0]["text"] for key, reply in replies.items()
             if "result" in reply and "content" in reply["result"]}
-    check("the server answers every request and no notification", sorted(replies) == list(range(1, 15)), out[:200])
+    check("the server answers every request and no notification", sorted(replies) == list(range(1, 19)), out[:200])
     check("initialize echoes the protocol version and declares tools",
           replies[1]["result"]["protocolVersion"] == "2025-06-18" and "tools" in replies[1]["result"]["capabilities"])
     check("nine tools are listed", [tool["name"] for tool in replies[2]["result"]["tools"]] ==
@@ -274,6 +325,11 @@ with tempfile.TemporaryDirectory() as folder:
     check("a tool error is a tool result, not a protocol error", replies[12]["result"]["isError"] is True)
     check("a channel without any time is a tool error", replies[13]["result"]["isError"] is True, text[13])
     check("an unknown method is a protocol error", replies[14]["error"]["code"] == -32601)
+    check("a missing argument is named", replies[15]["result"]["isError"] and "missing argument 'text'" in text[15] and
+          "missing argument 'name'" in text[16], (text[15], text[16]))
+    check("a deadline that cannot be shown is a tool error", replies[17]["result"]["isError"] and
+          "represented" in text[17], text[17])
+    check("an unknown tool is named as such", replies[18]["result"]["isError"] and "unknown tool" in text[18], text[18])
 
     # The session is found through an ancestor's session file when the environment does not name it.
     bare = dict(env)
