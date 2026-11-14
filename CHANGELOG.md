@@ -14,7 +14,7 @@ All notable changes to this project are listed here. The format follows
 - The program path in printed hints is shell-quoted, so a path that contains a space can be pasted.
 - A liveness interval under a minute is shown in seconds (it was shown as "every 0 min").
 - The text of a `beat` was stored but never shown. It is now shown with the last sign of life, and a `beat` without
-  text clears it.
+  text, or a tool call of the bound subagent, clears it.
 - An MCP call with a missing required argument now names the argument.
 - Every command-line argument has help text, and the "no session id" error no longer suggests a flag the MCP server
   does not take.
