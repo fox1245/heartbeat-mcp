@@ -433,6 +433,7 @@ def hook_answer(event: str, payload: dict) -> dict:
                 if channel.get("agent") == agent and channel["status"] == OPEN:
                     channel["last_beat"] = now
                     channel["beats"] += 1
+                    channel["last_text"] = None
                     if channel.get("interval"):
                         channel["due"] = now + channel["interval"]
                         channel["last_nag"] = 0.0

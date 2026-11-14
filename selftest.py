@@ -188,6 +188,10 @@ with tempfile.TemporaryDirectory() as folder:
     check("a fired channel is not reported into a subagent's context",
           hook("PostToolUse", env, session, agent_id="agent-2") == {})
     check("a silent bound agent fires its channel", "[G]" in hook("Stop", env, session).get("reason", ""))
+    run(["beat", "G", "--text", "from outside"], env)
+    hook("PostToolUse", env, session, agent_id="agent-1")
+    check("a bound agent's tool call clears the text of an earlier beat",
+          "from outside" not in run(["list"], env)[1], run(["list"], env)[1])
     run(["close", "G"], env)
 
     # The notation can be set and cleared later.
