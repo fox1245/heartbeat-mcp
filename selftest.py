@@ -2,6 +2,7 @@
 """Self-test of heartbeat.py: runs the real program as subprocesses against a temporary state directory.
 Usage: python3 -I selftest.py   (prints one line per check and `bad=<n>` at the end; exit 0 only when bad=0)."""
 import fcntl
+import importlib.util
 import json
 import os
 import select
@@ -14,6 +15,10 @@ import uuid
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 PROGRAM = os.path.join(HERE, "heartbeat.py")
+sys.dont_write_bytecode = True
+_spec = importlib.util.spec_from_file_location("heartbeat_under_test", PROGRAM)
+program = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(program)           # only for building state files; every operation runs as a subprocess
 bad = 0
 
 
@@ -94,7 +99,10 @@ def end(*processes):
             except OSError:
                 pass
             process.kill()
-        process.communicate()
+        process.wait()
+        for stream in (process.stdin, process.stdout):
+            if stream is not None and not stream.closed:
+                stream.close()
 
 
 def blocked(answer):
@@ -175,7 +183,7 @@ with tempfile.TemporaryDirectory() as folder:
     check("the waiter exits when A's deadline passes", waiter.returncode == 0 and time.time() - started < 8)
     check("the waiter names the fired channel with its notation, and the quiet one",
           "[A] first job" in output and "OVERDUE" in output and "to do: read /tmp/x, then merge" in output and
-          "quiet: [B] second job" in output, output)
+          "quiet: 1 channel(s) still open: B" in output, output)
     check("the waiter for B alone is still waiting", partial.poll() is None)
 
     # Overdue.
@@ -468,6 +476,53 @@ with tempfile.TemporaryDirectory() as folder:
     finally:
         end(process)
     run(["close", "B"], penv)
+
+    # A waiter that decided to exit unregisters itself before it prints, and what it prints is bounded.
+    def crowd(path, fired_count, quiet_count):
+        """A state file with channels that have fired (finished) and channels that are quiet, long labels."""
+        stored = {"channels": {}, "waiters": [], "last_arm_nag": 0.0}
+        for index in range(fired_count + quiet_count):
+            name = f"{'f' if index < fired_count else 'q'}{index}"
+            channel = program.new_channel(name, "x" * 250, None, time.time() + 3600, None, None)
+            if index < fired_count:
+                channel["status"] = program.FINISHED
+            stored["channels"][name] = channel
+        with open(path, "w") as handle:
+            json.dump(stored, handle)
+
+    sid, penv, pfile = new_session()
+    os.makedirs(os.path.dirname(pfile), exist_ok=True)
+    crowd(pfile, 500, 0)                     # about 150 KB of output, far above a pipe's 64 KiB and the 8 KiB buffer
+    process = spawn(penv, "wait")
+    try:
+        ready, _, _ = select.select([process.stdout], [], [], 10)
+        first_byte = os.read(process.stdout.fileno(), 1) if ready else b""
+        check("a waiter with a lot to say starts to print", first_byte != b"")
+        check("a waiter is no longer registered once it prints",
+              not any(w.get("pid") == process.pid for w in read_state(pfile)["waiters"]),
+              read_state(pfile)["waiters"])
+    finally:
+        end(process)
+
+    sid, penv, pfile = new_session()
+    crowd(pfile, 1, 600)                     # one fired channel and 600 quiet ones, nobody reads the pipe
+    process = spawn(penv, "wait")
+    try:
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        check("a waiter with many quiet channels exits without anyone reading its output", process.poll() == 0,
+              process.poll())
+        process.kill()
+        output = process.communicate()[0].decode()
+        quiet_line = next((line for line in output.splitlines() if line.strip().startswith("quiet:")), "")
+        check("the fired channel is printed in full", "[f0] " + "x" * 250 in output, output[:300])
+        check("the quiet channels are a count and a few names",
+              "600 channel(s)" in quiet_line and len(quiet_line) < 300 and len(output) < 2000,
+              (len(quiet_line), len(output)))
+    finally:
+        end(process)
 
     # The session is found through an ancestor's session file when the environment does not name it.
     bare = dict(env)
