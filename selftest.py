@@ -105,6 +105,18 @@ def end(*processes):
                 stream.close()
 
 
+def stop_while_idle(process, path):
+    """Stops a waiter at a moment that does not depend on luck. The test holds the state's lock, so the waiter is
+    outside every locked section (asleep between polls, or waiting to enter one) and keeps no lock when it stops;
+    the lock is released once the process is seen stopped."""
+    with open(path) as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        os.kill(process.pid, signal.SIGSTOP)
+        end_time = time.time() + 10
+        while proc_stat(process.pid)[0] not in "Tt" and time.time() < end_time:
+            time.sleep(0.01)
+
+
 def blocked(answer):
     return answer.get("decision") == "block"
 
@@ -431,10 +443,7 @@ with tempfile.TemporaryDirectory() as folder:
     try:
         registered(second, pfile)
         check("a second waiter is counted", hook("Stop", penv, sid) == {})
-        os.kill(second.pid, signal.SIGSTOP)
-        stopped_at = time.time()
-        while proc_stat(second.pid)[0] not in "Tt" and time.time() - stopped_at < 10:
-            time.sleep(0.01)
+        stop_while_idle(second, pfile)
         check("the waiter is stopped", proc_stat(second.pid)[0] in "Tt", proc_stat(second.pid))
         answer = hook("Stop", penv, sid)
         check("a stopped waiter does not count", blocked(answer) and "not watched" in answer.get("reason", ""), answer)
@@ -620,9 +629,7 @@ with tempfile.TemporaryDirectory() as folder:
     holder = spawn(penv, "wait")
     try:
         registered(holder, pfile)
-        os.kill(holder.pid, signal.SIGSTOP)
-        while proc_stat(holder.pid)[0] not in "Tt":
-            time.sleep(0.01)
+        stop_while_idle(holder, pfile)
         check("a refusal while the waiter is stopped", blocked(continuation()))
         os.kill(holder.pid, signal.SIGCONT)
         while proc_stat(holder.pid)[0] in "Tt":
