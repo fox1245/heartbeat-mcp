@@ -223,6 +223,12 @@ answers `{}`. A session that never opened a channel costs one `stat` call and ge
 | `PostToolUse`, `UserPromptSubmit` | If the call was made inside a subagent (the payload has `agent_id`): counts as a sign of life on the open channels bound to that agent, answers `{}`. Otherwise: if a channel has fired and was not mentioned during the last `HEARTBEAT_NAG_SEC`, adds all fired channels to the agent's context (`additionalContext`). If nothing fired but open channels have no waiter, adds a reminder naming the waiter command, at most once per `HEARTBEAT_ARM_NAG_SEC`. |
 | `Stop` | Refuses to end the turn (`decision: block`, with the reason shown to the agent) while a channel has fired, and also while an open channel is not watched by a waiter. The refusal for a fired channel names the unwatched open channels as well and says to start a waiter once the fired channels are handled. A payload with `stop_hook_active` (the turn continued because of a Stop hook) is not refused for a fired channel, but it is still refused for unwatched channels, at most `HEARTBEAT_STOP_UNWATCHED_MAX` times in a row: then the hook lets the turn end and says so in a `systemMessage`. Starting a waiter, or a Stop that does not block, resets that count. |
 
+When the state stays locked by another process for longer than `HEARTBEAT_LOCK_WAIT_SEC`, a hook cannot read it and
+answers without breaking the host: `{}` for `PostToolUse` and `UserPromptSubmit`, and for `Stop` an answer that does
+not refuse, only a `systemMessage` saying that the state is locked and open channels may be unwatched. `Stop` lets the
+turn end here because it can neither see the channels nor count its refusals, and a refusal it cannot bound could
+repeat for ever.
+
 Environment variables that tune the behaviour (a value that is not a number falls back to the default):
 
 | Variable | Default | Meaning |
@@ -231,6 +237,7 @@ Environment variables that tune the behaviour (a value that is not a number fall
 | `HEARTBEAT_NAG_SEC` | `300` | a fired channel is repeated in the agent's context this often |
 | `HEARTBEAT_ARM_NAG_SEC` | `600` | the "channels are not covered by a waiter" reminder is repeated this often |
 | `HEARTBEAT_STOP_UNWATCHED_MAX` | `3` | how many times in a row `Stop` refuses because open channels have no waiter before it lets the turn end (a value that is not a whole number of zero or more falls back to the default) |
+| `HEARTBEAT_LOCK_WAIT_SEC` | `5` | how long taking the state file's lock may take before the command gives up (see [State files and locking](#state-files-and-locking)) |
 | `HEARTBEAT_WAIT_POLL_SEC` | `15` | a waiter re-reads the state at least this often (it also wakes at the next deadline, and never sleeps less than one second) |
 | `CLAUDE_CODE_SESSION_ID` | set by the harness | the session the command belongs to |
 
@@ -250,6 +257,10 @@ Environment variables that tune the behaviour (a value that is not a number fall
   in the locked section in which it decides to exit, before it prints. Records of processes that are gone or are not
   the recorded process are dropped when the state is next written; a stopped waiter stays, because it may be
   continued.
+- Taking the lock does not wait for ever. A process that holds it (stopped or hung) would otherwise stall every
+  command and hook of the session. After `HEARTBEAT_LOCK_WAIT_SEC` the command exits with status 2 and
+  `heartbeat: the state of this session is locked by another process ...`, an MCP tool returns that text as a tool
+  error, a hook answers as described under [Hooks](#hooks), and a waiter tries again at its next poll.
 - Closed channels stay in the file for 24 hours, then they are dropped the next time a channel is closed. A closed
   channel's name can be opened again.
 - The session is, in order: the `--session` option or the hook payload's `session_id`; `CLAUDE_CODE_SESSION_ID`; the
