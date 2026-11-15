@@ -278,9 +278,18 @@ def _is_waiter(waiter: dict) -> bool:
     return _subcommand(arguments, directory) == "wait"
 
 
-def uncovered(data: dict) -> list[dict]:
-    """Open channels that no running waiter watches (a waiter with no channel list watches all)."""
-    waiters = [waiter for waiter in data["waiters"] if _is_waiter(waiter)]
+def _exits_next_poll(waiter: dict, data: dict, now: float) -> bool:
+    """Whether a waiter will exit the next time it polls: a channel it watches has fired, or it watches none that is
+    still open. It decides this from the same state a waiter reads in `run_wait`."""
+    names = waiter.get("channels")
+    watched = [channel for channel in live(data) if names is None or channel["name"] in names]
+    return not watched or any(events_of(channel, now) for channel in watched)
+
+
+def uncovered(data: dict, now: float) -> list[dict]:
+    """Open channels that no waiter watches. A waiter counts when it is running and will not exit on its next poll;
+    a waiter with no channel list watches all."""
+    waiters = [waiter for waiter in data["waiters"] if _is_waiter(waiter) and not _exits_next_poll(waiter, data, now)]
     if any(waiter.get("channels") is None for waiter in waiters):
         return []
     watched = {name for waiter in waiters for name in waiter.get("channels") or []}
@@ -302,6 +311,11 @@ def _get(data: dict, name: str) -> dict:
     return channel
 
 
+def _result(data: dict, channel: dict, now: float) -> dict:
+    """A channel after an operation, and whether every open channel is now watched by a waiter."""
+    return {"channel": dict(channel), "covered": not uncovered(data, now)}
+
+
 def op_open(sid: str, name: str | None, label: str, seconds: float | None, every: float | None,
             notation: str | None, agent: str | None) -> dict:
     if not label.strip():
@@ -320,7 +334,7 @@ def op_open(sid: str, name: str | None, label: str, seconds: float | None, every
         data["channels"][name] = new_channel(name, label.strip(), (notation or "").strip() or None,
                                              due, every,
                                              (agent or "").strip() or None)
-        return {"channel": dict(data["channels"][name]), "covered": not uncovered(data)}
+        return {"channel": dict(data["channels"][name]), "covered": not uncovered(data, now)}
 
 
 def op_beat(sid: str, name: str, text: str | None = None) -> dict:
@@ -361,23 +375,25 @@ def op_finish(sid: str, name: str, text: str | None) -> dict:
 
 def op_extend(sid: str, name: str, seconds: float) -> dict:
     """The agent looked and the work goes on: a new deadline; notes are acknowledged."""
+    now = time.time()
     with state(sid) as data:
         channel = _get(data, name)
         channel["status"] = OPEN
-        channel["due"] = deadline_after(time.time(), seconds)
+        channel["due"] = deadline_after(now, seconds)
         channel["notes"] = []
         channel["finish_text"] = None
         channel["last_nag"] = 0.0
-        return dict(channel)
+        return _result(data, channel, now)
 
 
 def op_ack(sid: str, name: str) -> dict:
     """The agent read the channel's notes; the deadline stays."""
+    now = time.time()
     with state(sid) as data:
         channel = _get(data, name)
         channel["notes"] = []
         channel["last_nag"] = 0.0
-        return dict(channel)
+        return _result(data, channel, now)
 
 
 def op_notate(sid: str, name: str, notation: str | None) -> dict:
@@ -397,12 +413,12 @@ def op_close(sid: str, name: str) -> dict:
         channel["closed"] = now
         data["channels"] = {key: ch for key, ch in data["channels"].items()
                             if ch["status"] != CLOSED or now - ch.get("closed", 0) < 86400}
-        return dict(channel)
+        return _result(data, channel, now)
 
 
 def op_list(sid: str) -> dict:
     with state(sid, write=False) as data:
-        return {"channels": live(data), "uncovered": [channel["name"] for channel in uncovered(data)]}
+        return {"channels": live(data), "uncovered": [channel["name"] for channel in uncovered(data, time.time())]}
 
 
 def render_list(listing: dict) -> str:
@@ -497,17 +513,21 @@ def hook_answer(event: str, payload: dict) -> dict:
                         channel["last_nag"] = 0.0
             return {}
         hits = fired(data, now)
-        bare = uncovered(data)
+        bare = uncovered(data, now)
         if event == "Stop":
             if payload.get("stop_hook_active"):
                 return {}                             # the turn already continued because of a Stop hook: no loop
             if hits:
                 listing = "\n".join("  " + describe(channel, now) for channel in hits)
-                return {"decision": "block",
-                        "reason": "Heartbeat: channels fired. Look at each one now (read the work's own output, "
-                                  "resume or stop its agent), then close it, extend it or acknowledge its notes:\n"
-                                  f"{listing}\n({COMMAND} close <name> | extend <name> --in <time> | "
-                                  "ack <name>)"}
+                reason = ("Heartbeat: channels fired. Look at each one now (read the work's own output, "
+                          "resume or stop its agent), then close it, extend it or acknowledge its notes:\n"
+                          f"{listing}\n({COMMAND} close <name> | extend <name> --in <time> | ack <name>)")
+                rest = [channel["name"] for channel in bare if not events_of(channel, now)]
+                if rest:
+                    reason += (f"\nOpen channel(s) not watched by a waiter: {', '.join(rest)}. A waiter started now "
+                               "would exit at once because a channel has fired, so start one after the fired "
+                               f"channels are closed, extended or acknowledged. {ARM_HINT}")
+                return {"decision": "block", "reason": reason}
             if bare:
                 return {"decision": "block",
                         "reason": f"Heartbeat: {len(bare)} open channel(s) are not watched by a waiter "
@@ -610,6 +630,11 @@ def _required(arguments: dict, key: str) -> str:
     return str(value)
 
 
+def _with_hint(text: str, result: dict) -> str:
+    """The reply of an operation, followed by how to start a waiter when open channels are left unwatched."""
+    return text if result["covered"] else f"{text}\n{ARM_HINT}"
+
+
 def call_tool(name: str, arguments: dict) -> str:
     if name not in {tool["name"] for tool in TOOLS}:
         raise HeartbeatError(f"unknown tool {name!r}")
@@ -618,8 +643,7 @@ def call_tool(name: str, arguments: dict) -> str:
     if name == "heartbeat_open":
         result = op_open(sid, arguments.get("name"), _required(arguments, "label"), _minutes(arguments, "minutes"),
                          _minutes(arguments, "every_minutes"), arguments.get("notation"), arguments.get("agent"))
-        text = "opened " + describe(result["channel"], now)
-        return text if result["covered"] else f"{text}\n{ARM_HINT}"
+        return _with_hint("opened " + describe(result["channel"], now), result)
     if name == "heartbeat_list":
         return render_list(op_list(sid))
     channel_name = _required(arguments, "name")
@@ -633,14 +657,16 @@ def call_tool(name: str, arguments: dict) -> str:
         seconds = _minutes(arguments, "minutes")
         if seconds is None:
             raise HeartbeatError("minutes is required")
-        return "extended " + describe(op_extend(sid, channel_name, seconds), now)
+        result = op_extend(sid, channel_name, seconds)
+        return _with_hint("extended " + describe(result["channel"], now), result)
     if name == "heartbeat_ack":
-        return "acknowledged " + describe(op_ack(sid, channel_name), now)
+        result = op_ack(sid, channel_name)
+        return _with_hint("acknowledged " + describe(result["channel"], now), result)
     if name == "heartbeat_notate":
         return "notation set on " + describe(op_notate(sid, channel_name, arguments.get("notation")), now)
     if name == "heartbeat_close":
-        channel = op_close(sid, channel_name)
-        return f"closed [{channel['name']}] {channel['label']}"
+        result = op_close(sid, channel_name)
+        return _with_hint(f"closed [{result['channel']['name']}] {result['channel']['label']}", result)
     raise HeartbeatError(f"unknown tool {name!r}")              # not reached: every listed tool is handled above
 
 
@@ -744,9 +770,7 @@ def main(argv: list[str]) -> int:
                              parse_duration(arguments.duration) if arguments.duration else None,
                              parse_duration(arguments.every) if arguments.every else None,
                              arguments.notation, arguments.agent)
-            print("opened " + describe(result["channel"], now))
-            if not result["covered"]:
-                print(ARM_HINT)
+            print(_with_hint("opened " + describe(result["channel"], now), result))
         elif arguments.command == "beat":
             print("beat on " + describe(op_beat(sid, arguments.name, arguments.text), now))
         elif arguments.command == "finish":
@@ -754,14 +778,16 @@ def main(argv: list[str]) -> int:
         elif arguments.command == "note":
             print("noted on " + describe(op_note(sid, arguments.name, arguments.text), now))
         elif arguments.command == "extend":
-            print("extended " + describe(op_extend(sid, arguments.name, parse_duration(arguments.duration)), now))
+            result = op_extend(sid, arguments.name, parse_duration(arguments.duration))
+            print(_with_hint("extended " + describe(result["channel"], now), result))
         elif arguments.command == "ack":
-            print("acknowledged " + describe(op_ack(sid, arguments.name), now))
+            result = op_ack(sid, arguments.name)
+            print(_with_hint("acknowledged " + describe(result["channel"], now), result))
         elif arguments.command == "notate":
             print("notation set on " + describe(op_notate(sid, arguments.name, arguments.text), now))
         elif arguments.command in ("close", "done"):
-            channel = op_close(sid, arguments.name)
-            print(f"closed [{channel['name']}] {channel['label']}")
+            result = op_close(sid, arguments.name)
+            print(_with_hint(f"closed [{result['channel']['name']}] {result['channel']['label']}", result))
         elif arguments.command == "list":
             print(render_list(op_list(sid)))
         elif arguments.command == "wait":
