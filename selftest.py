@@ -114,7 +114,7 @@ with tempfile.TemporaryDirectory() as folder:
     other = str(uuid.uuid4())
     env = {"PATH": os.environ.get("PATH", ""), "HOME": folder, "HEARTBEAT_STATE_DIR": os.path.join(folder, "state"),
            "CLAUDE_CODE_SESSION_ID": session, "HEARTBEAT_WAIT_POLL_SEC": "1", "HEARTBEAT_NAG_SEC": "2",
-           "HEARTBEAT_ARM_NAG_SEC": "2"}
+           "HEARTBEAT_ARM_NAG_SEC": "2", "HEARTBEAT_STOP_UNWATCHED_MAX": "100"}
     state_file = os.path.join(folder, "state", f"{session}.json")
 
     # A session with no state: every hook answers {} and creates nothing.
@@ -145,8 +145,8 @@ with tempfile.TemporaryDirectory() as folder:
     check("Stop is blocked while open channels are not watched",
           answer.get("decision") == "block" and "not watched" in answer.get("reason", "") and
           "A" in answer["reason"] and "B" in answer["reason"], answer)
-    check("Stop is not blocked a second time in one continuation",
-          hook("Stop", env, session, stop_hook_active=True) == {})
+    check("Stop is blocked again in a continuation while channels are still unwatched",
+          blocked(hook("Stop", env, session, stop_hook_active=True)))
     answer = hook("PostToolUse", env, session)
     check("a tool result reminds that channels are not watched", "not watched" in context(answer), answer)
     check("the hook names its event", answer.get("hookSpecificOutput", {}).get("hookEventName") == "PostToolUse")
@@ -582,6 +582,58 @@ with tempfile.TemporaryDirectory() as folder:
         check("no hint while a waiter covers every open channel", code == 0 and wait_hint not in out, out)
     finally:
         end(covering)
+
+    # A Stop in a continuation still refuses while channels are unwatched, up to a bound, and then lets the turn end.
+    check("the bound on unwatched refusals has a small default",
+          isinstance(getattr(program, "STOP_UNWATCHED_MAX", None), int) and 1 <= program.STOP_UNWATCHED_MAX <= 5,
+          getattr(program, "STOP_UNWATCHED_MAX", None))
+    for garbage in ("nan", "-3", "many", ""):
+        code, out, err = run(["list"], dict(env, HEARTBEAT_STOP_UNWATCHED_MAX=garbage))
+        check(f"a bound of {garbage!r} does not break the program", code == 0, err)
+    sid, penv, pfile = new_session(HEARTBEAT_STOP_UNWATCHED_MAX="2", HEARTBEAT_WAIT_POLL_SEC="30")
+    run(["open", "A", "--label", "first", "--in", "1h"], penv)
+    run(["open", "B", "--label", "second", "--in", "1h"], penv)
+
+    def continuation():
+        return hook("Stop", penv, sid, stop_hook_active=True)
+
+    def three():
+        """Three Stops in a row, each in a continuation: 'block' or 'end' (the turn is let go)."""
+        return ["block" if blocked(answer) else "end" for answer in (continuation(), continuation(), continuation())]
+
+    first = hook("Stop", penv, sid)
+    check("Stop refuses, then refuses in the continuation, then lets the turn end, then refuses again",
+          [blocked(first), blocked(continuation()), blocked(continuation()), blocked(continuation())] ==
+          [True, True, False, True])                       # leaves the count at 1
+    starter = spawn(penv, "wait")
+    try:
+        registered(starter, pfile)
+    finally:
+        end(starter)
+    check("starting a waiter resets the count (refuse, refuse, end again)", three() == ["block", "block", "end"])
+    answer = continuation()                              # the count is 0 again after the end
+    answer = continuation()
+    answer = continuation()
+    check("the answer that lets the turn end says why",
+          answer.get("decision") is None and "not watched" in answer.get("systemMessage", ""), answer)
+    # Raise the count while a waiter is stopped (it does not count), then let it continue: Stop passes and resets it.
+    holder = spawn(penv, "wait")
+    try:
+        registered(holder, pfile)
+        os.kill(holder.pid, signal.SIGSTOP)
+        while proc_stat(holder.pid)[0] not in "Tt":
+            time.sleep(0.01)
+        check("a refusal while the waiter is stopped", blocked(continuation()))
+        os.kill(holder.pid, signal.SIGCONT)
+        while proc_stat(holder.pid)[0] in "Tt":
+            time.sleep(0.01)
+        check("a covering waiter lets Stop pass", continuation() == {})
+    finally:
+        end(holder)
+    check("a Stop that does not block resets the count", three() == ["block", "block", "end"])
+    run(["close", "A"], penv)
+    run(["close", "B"], penv)
+    check("a continuation with nothing unwatched passes", continuation() == {})
 
     # The session is found through an ancestor's session file when the environment does not name it.
     bare = dict(env)
