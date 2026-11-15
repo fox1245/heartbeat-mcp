@@ -121,7 +121,7 @@ def state(sid: str, write: bool = True):
         _migrate(data)
         yield data
         if write:
-            data["waiters"] = [waiter for waiter in data["waiters"] if _is_waiter(waiter)]
+            data["waiters"] = [waiter for waiter in data["waiters"] if _is_waiter(waiter, running=False)]
             text = json.dumps(data, indent=1)
             if text != raw:                            # a waiter's quiet poll rewrites nothing
                 handle.seek(0)
@@ -262,12 +262,15 @@ def _subcommand(arguments: list[str], directory: str) -> str | None:
     return None
 
 
-def _is_waiter(waiter: dict) -> bool:
-    """Whether a recorded waiter is still the process that recorded itself, running, and this program waiting (a
-    reused pid does not count: the process start time is compared with the one the waiter recorded)."""
+def _is_waiter(waiter: dict, running: bool = True) -> bool:
+    """Whether a recorded waiter is still the process that recorded itself and this program waiting (a reused pid
+    does not count: the process start time is compared with the one the waiter recorded). A stopped process does not
+    count while `running` is required; the state keeps it, because it may be continued."""
     stat = process_stat(waiter.get("pid"))
-    if stat is None or stat[0] in "TtZX" or waiter.get("start_ticks") is None or stat[1] != waiter["start_ticks"]:
-        return False                                  # not running, stopped, or another process with this pid
+    if stat is None or stat[0] in "ZX" or (running and stat[0] in "Tt"):
+        return False                                  # gone, or stopped when it must run
+    if waiter.get("start_ticks") is None or stat[1] != waiter["start_ticks"]:
+        return False                                  # another process with this pid
     try:
         with open(f"/proc/{int(waiter['pid'])}/cmdline", "rb") as handle:
             arguments = [os.fsdecode(argument) for argument in handle.read().split(b"\0")]
