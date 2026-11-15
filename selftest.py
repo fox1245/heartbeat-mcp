@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Self-test of heartbeat.py: runs the real program as subprocesses against a temporary state directory.
 Usage: python3 -I selftest.py   (prints one line per check and `bad=<n>` at the end; exit 0 only when bad=0)."""
+import fcntl
 import json
 import os
+import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -41,6 +44,61 @@ def start_waiter(env, *arguments):
                                stdout=subprocess.PIPE, text=True)
     time.sleep(0.6)
     return process
+
+
+def read_state(path):
+    """The state file as written; read under the program's own lock, so a rewrite in progress is never seen half done."""
+    with open(path) as handle:
+        fcntl.flock(handle, fcntl.LOCK_SH)
+        return json.load(handle)
+
+
+def edit_state(path, change):
+    with open(path, "r+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        stored = json.load(handle)
+        change(stored)
+        handle.seek(0)
+        handle.truncate()
+        json.dump(stored, handle)
+
+
+def proc_stat(pid):
+    """(state letter, start time in clock ticks) of a process, read from the fields after the last ')'."""
+    with open(f"/proc/{pid}/stat", "rb") as handle:
+        raw = handle.read()
+    rest = raw[raw.rindex(b")") + 1:].split()
+    return rest[0].decode(), int(rest[19])
+
+
+def spawn(env, *arguments, **options):
+    return subprocess.Popen([options.pop("python", sys.executable), "-I", PROGRAM, *arguments], env=env,
+                            stdout=subprocess.PIPE, **options)
+
+
+def registered(process, path, timeout=10):
+    """Waits until the process has recorded itself as a waiter (or has exited); True when it is recorded."""
+    end = time.time() + timeout
+    while time.time() < end and process.poll() is None:
+        if any(waiter.get("pid") == process.pid for waiter in read_state(path)["waiters"]):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def end(*processes):
+    for process in processes:
+        if process.poll() is None:
+            try:
+                os.kill(process.pid, signal.SIGCONT)
+            except OSError:
+                pass
+            process.kill()
+        process.communicate()
+
+
+def blocked(answer):
+    return answer.get("decision") == "block"
 
 
 with tempfile.TemporaryDirectory() as folder:
@@ -334,6 +392,82 @@ with tempfile.TemporaryDirectory() as folder:
     check("a deadline that cannot be shown is a tool error", replies[17]["result"]["isError"] and
           "represented" in text[17], text[17])
     check("an unknown tool is named as such", replies[18]["result"]["isError"] and "unknown tool" in text[18], text[18])
+
+    # A recorded waiter counts only if it is the process that recorded itself, running, and waiting.
+    def new_session(**extra):
+        sid = str(uuid.uuid4())
+        return sid, dict(env, CLAUDE_CODE_SESSION_ID=sid, **extra), os.path.join(folder, "state", f"{sid}.json")
+
+    sid, penv, pfile = new_session(HEARTBEAT_WAIT_POLL_SEC="30")
+    run(["open", "B", "--label", "long job", "--in", "1h"], penv)
+    first = spawn(penv, "wait")
+    try:
+        up = registered(first, pfile)
+        check("a waiter records itself", up)
+        record = next((w for w in read_state(pfile)["waiters"] if w.get("pid") == first.pid), {}) if up else {}
+        check("a waiter records its process start time, as read from /proc",
+              record.get("start_ticks") == proc_stat(first.pid)[1], record)
+        check("Stop passes while that waiter runs", hook("Stop", penv, sid) == {})
+        edit_state(pfile, lambda stored: stored["waiters"][0].update(start_ticks=record.get("start_ticks", 0) + 1))
+        answer = hook("Stop", penv, sid)
+        check("a recorded pid whose process started at another time does not count",
+              blocked(answer) and "not watched" in answer.get("reason", ""), answer)
+        run(["notate", "B", "--text", "x"], penv)
+        check("a waiter that does not count is dropped when the state is next written",
+              not read_state(pfile)["waiters"], read_state(pfile)["waiters"])
+    finally:
+        end(first)
+
+    # A stopped process does not wake anything.
+    second = spawn(penv, "wait")
+    try:
+        registered(second, pfile)
+        check("a second waiter is counted", hook("Stop", penv, sid) == {})
+        os.kill(second.pid, signal.SIGSTOP)
+        stopped_at = time.time()
+        while proc_stat(second.pid)[0] not in "Tt" and time.time() - stopped_at < 10:
+            time.sleep(0.01)
+        check("the waiter is stopped", proc_stat(second.pid)[0] in "Tt", proc_stat(second.pid))
+        answer = hook("Stop", penv, sid)
+        check("a stopped waiter does not count", blocked(answer) and "not watched" in answer.get("reason", ""), answer)
+    finally:
+        end(second)
+
+    # "wait" must be the subcommand, not any argument: `hook wait` stays alive reading its input.
+    impostor = spawn(penv, "hook", "wait", stdin=subprocess.PIPE)
+    try:
+        edit_state(pfile, lambda stored: stored["waiters"].append(
+            {"pid": impostor.pid, "started": time.time(), "start_ticks": proc_stat(impostor.pid)[1],
+             "channels": None}))
+        answer = hook("Stop", penv, sid)
+        check("a process with the word wait as another command's argument does not count",
+              blocked(answer) and "not watched" in answer.get("reason", ""), answer)
+    finally:
+        end(impostor)
+
+    # The subcommand is found after the global option, in every spelling argparse accepts.
+    for label, front in (("--session ID", ["--session", sid]), ("--session=ID", [f"--session={sid}"]),
+                         ("an abbreviated --sess ID", ["--sess", sid])):
+        process = spawn(penv, *front, "wait")
+        try:
+            up = registered(process, pfile)
+            check(f"a waiter started with {label} is recognised", up and hook("Stop", penv, sid) == {}, up)
+        finally:
+            end(process)
+
+    # A command name with spaces and parentheses does not confuse the process fields.
+    odd = os.path.join(folder, "a b) 3 (4 5")
+    os.symlink(sys.executable, odd)
+    process = spawn(penv, "wait", python=odd)
+    try:
+        up = registered(process, pfile)
+        record = next((w for w in read_state(pfile)["waiters"] if w.get("pid") == process.pid), {}) if up else {}
+        check("a waiter whose command name holds spaces and a parenthesis records its start time",
+              record.get("start_ticks") == proc_stat(process.pid)[1], (record, open(f"/proc/{process.pid}/stat").read()))
+        check("and is recognised", hook("Stop", penv, sid) == {})
+    finally:
+        end(process)
+    run(["close", "B"], penv)
 
     # The session is found through an ancestor's session file when the environment does not name it.
     bare = dict(env)
