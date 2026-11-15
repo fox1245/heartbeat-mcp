@@ -54,6 +54,9 @@ STATE_DIR = os.environ.get("HEARTBEAT_STATE_DIR") or os.path.join(
 NAG_EVERY_SEC = _setting("HEARTBEAT_NAG_SEC", 300.0)          # a fired channel is repeated in context this often
 ARM_NAG_EVERY_SEC = _setting("HEARTBEAT_ARM_NAG_SEC", 600.0)  # "channels are not covered" is repeated this often
 WAIT_POLL_SEC = _setting("HEARTBEAT_WAIT_POLL_SEC", 15.0)     # a waiter re-reads the state this often
+LOCK_WAIT_SEC = _setting("HEARTBEAT_LOCK_WAIT_SEC", 5.0)       # how long taking the state's lock may take
+if not 0 <= LOCK_WAIT_SEC < 1e6:
+    LOCK_WAIT_SEC = 5.0
 STOP_UNWATCHED_MAX = _count_setting("HEARTBEAT_STOP_UNWATCHED_MAX", 3)  # Stop refusals in a row for unwatched channels
 WAIT_QUIET_NAMES_MAX = 5                                      # a waiter names at most this many quiet channels
 NAME_MAX = 64
@@ -66,6 +69,10 @@ OPEN, FINISHED, CLOSED = "open", "finished", "closed"
 
 class HeartbeatError(Exception):
     """A caller error; the message is shown as it is."""
+
+
+class StateLocked(HeartbeatError):
+    """The state file stayed locked by another process for longer than LOCK_WAIT_SEC."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -113,13 +120,28 @@ def _migrate(data: dict) -> None:
     data.pop("waiter", None)
 
 
+def _lock(handle) -> None:
+    """Takes the exclusive lock without blocking for ever: a process that holds it (stopped, or hung) must not stall
+    every command and hook of the session."""
+    end = time.monotonic() + LOCK_WAIT_SEC
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                raise StateLocked(f"the state of this session is locked by another process (waited "
+                                  f"{LOCK_WAIT_SEC:g} s); try again") from None
+            time.sleep(0.02)
+
+
 @contextlib.contextmanager
 def state(sid: str, write: bool = True):
     """The session's state as a dict, read (and written back) under an exclusive lock."""
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     descriptor = os.open(state_path(sid), os.O_RDWR | os.O_CREAT, 0o600)
     with os.fdopen(descriptor, "r+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        _lock(handle)
         raw = handle.read()
         data = json.loads(raw) if raw.strip() else {}
         data.setdefault("channels", {})
@@ -475,26 +497,34 @@ def run_wait(sid: str, names: list[str] | None) -> int:
         while True:
             now = time.time()
             report = None
-            with state(sid) as data:
-                watched = [channel for channel in live(data) if not names or channel["name"] in names]
-                hits = [channel for channel in watched if events_of(channel, now)]
-                if not watched:
-                    report = "heartbeat: no open channel to wait for"
-                elif hits:
-                    report = _wait_report(hits, [channel for channel in live(data) if not events_of(channel, now)], now)
-                else:
-                    next_due = min(channel["due"] for channel in watched if channel["status"] == OPEN)
-                if report is not None:
-                    data["waiters"] = [waiter for waiter in data["waiters"] if waiter.get("pid") != os.getpid()]
-                    registered = False
+            try:
+                with state(sid) as data:
+                    watched = [channel for channel in live(data) if not names or channel["name"] in names]
+                    hits = [channel for channel in watched if events_of(channel, now)]
+                    if not watched:
+                        report = "heartbeat: no open channel to wait for"
+                    elif hits:
+                        report = _wait_report(hits, [channel for channel in live(data) if not events_of(channel, now)],
+                                              now)
+                    else:
+                        next_due = min(channel["due"] for channel in watched if channel["status"] == OPEN)
+                    if report is not None:
+                        data["waiters"] = [waiter for waiter in data["waiters"] if waiter.get("pid") != os.getpid()]
+                        registered = False
+            except StateLocked:
+                time.sleep(max(1.0, WAIT_POLL_SEC))        # another process holds the lock: try again at the next poll
+                continue
             if report is not None:
                 print(report)
                 return 0
             time.sleep(max(1.0, min(WAIT_POLL_SEC, next_due - now)))
     finally:
         if registered:                                 # an interrupt or an error: do not leave a record behind
-            with state(sid) as data:
-                data["waiters"] = [waiter for waiter in data["waiters"] if waiter.get("pid") != os.getpid()]
+            try:
+                with state(sid) as data:
+                    data["waiters"] = [waiter for waiter in data["waiters"] if waiter.get("pid") != os.getpid()]
+            except StateLocked:
+                pass                                   # the process is gone: the next write drops its record
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -573,6 +603,11 @@ def run_hook(event: str) -> int:
         except ValueError:
             payload = {}
         answer = hook_answer(event, payload if isinstance(payload, dict) else {})
+    except StateLocked as error:
+        # The state cannot be read, so nothing can be counted. A Stop that refused here could refuse for ever: it lets
+        # the turn end and says so. Every other event adds nothing.
+        answer = {"systemMessage": f"Heartbeat: {error}. The turn is allowed to end; open channels may be unwatched."} \
+            if event == "Stop" else {}
     except Exception:                                  # a reminder tool must never break the host's hooks
         answer = {}
     print(json.dumps(answer))
