@@ -524,6 +524,59 @@ with tempfile.TemporaryDirectory() as folder:
     finally:
         end(process)
 
+    # A waiter that has seen a fired channel exits on its next poll: it does not cover the other channels.
+    wait_hint = os.path.realpath(PROGRAM) + " wait"
+    sid, penv, pfile = new_session(HEARTBEAT_WAIT_POLL_SEC="30")
+    run(["open", "A", "--label", "first", "--in", "1h"], penv)
+    run(["open", "B", "--label", "second", "--in", "1h"], penv)
+    sleeper = spawn(penv, "wait")
+    try:
+        registered(sleeper, pfile)
+        check("a waiter that has seen nothing fire covers every channel", hook("Stop", penv, sid) == {})
+        run(["finish", "A"], penv)
+        check("the waiter has not exited yet (it sleeps until its next poll)", sleeper.poll() is None)
+        answer = hook("Stop", penv, sid)
+        reason = answer.get("reason", "")
+        check("Stop names the fired channel", blocked(answer) and "[A]" in reason, answer)
+        check("Stop also says which open channels are not watched and how to start a waiter",
+              "not watched" in reason and "B" in reason.split("not watched")[-1] and wait_hint in reason, reason)
+        check("a waiter that is about to exit does not cover the others in list",
+              "NOT covered by a waiter: B" in run(["list"], penv)[1], run(["list"], penv)[1])
+    finally:
+        end(sleeper)
+
+    # close, extend and ack say how to start a waiter when open channels are left unwatched.
+    sid, penv, pfile = new_session()
+    run(["open", "A", "--label", "first", "--in", "1h"], penv)
+    run(["open", "B", "--label", "second", "--in", "1h"], penv)
+    run(["note", "A", "--text", "look"], penv)
+    for verb, arguments in (("ack", ["ack", "A"]), ("extend", ["extend", "A", "--in", "1h"]),
+                            ("close", ["close", "A"])):
+        code, out, _ = run(arguments, penv)
+        check(f"{verb} says how to start a waiter while open channels are unwatched",
+              code == 0 and wait_hint in out, out)
+    code, out, _ = run(["close", "B"], penv)
+    check("close of the last channel says nothing more", code == 0 and wait_hint not in out, out)
+    run(["open", "A", "--label", "first", "--in", "1h"], penv)
+    run(["open", "B", "--label", "second", "--in", "1h"], penv)
+    answers = run(["mcp"], penv, stdin="\n".join(json.dumps(r) for r in (
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+         "params": {"name": "heartbeat_ack", "arguments": {"name": "A"}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "heartbeat_extend", "arguments": {"name": "A", "minutes": 5}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+         "params": {"name": "heartbeat_close", "arguments": {"name": "A"}}})) + "\n")[1]
+    texts = {reply["id"]: reply["result"]["content"][0]["text"] for reply in map(json.loads, answers.splitlines())}
+    check("the MCP tools ack, extend and close carry the same hint",
+          all(wait_hint in texts[key] for key in (1, 2, 3)), texts)
+    covering = spawn(penv, "wait")
+    try:
+        registered(covering, pfile)
+        code, out, _ = run(["extend", "B", "--in", "1h"], penv)
+        check("no hint while a waiter covers every open channel", code == 0 and wait_hint not in out, out)
+    finally:
+        end(covering)
+
     # The session is found through an ancestor's session file when the environment does not name it.
     bare = dict(env)
     del bare["CLAUDE_CODE_SESSION_ID"]
