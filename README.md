@@ -237,7 +237,7 @@ Environment variables that tune the behaviour (a value that is not a number fall
 | `HEARTBEAT_NAG_SEC` | `300` | a fired channel is repeated in the agent's context this often |
 | `HEARTBEAT_ARM_NAG_SEC` | `600` | the "channels are not covered by a waiter" reminder is repeated this often |
 | `HEARTBEAT_STOP_UNWATCHED_MAX` | `3` | how many times in a row `Stop` refuses because open channels have no waiter before it lets the turn end (a value that is not a whole number of zero or more falls back to the default) |
-| `HEARTBEAT_LOCK_WAIT_SEC` | `5` | how long taking the state file's lock may take before the command gives up (see [State files and locking](#state-files-and-locking)) |
+| `HEARTBEAT_LOCK_WAIT_SEC` | `2` | how long taking the state file's lock may take before the command gives up (see [State files and locking](#state-files-and-locking)) |
 | `HEARTBEAT_WAIT_POLL_SEC` | `15` | a waiter re-reads the state at least this often (it also wakes at the next deadline, and never sleeps less than one second) |
 | `CLAUDE_CODE_SESSION_ID` | set by the harness | the session the command belongs to |
 

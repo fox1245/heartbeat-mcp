@@ -17,7 +17,7 @@ All notable changes to this project are listed here. The format follows
 ### Fixed
 
 - Taking the state's lock no longer waits for ever. A stopped or hung process that held the lock stalled every
-  command and hook of the session. The wait is bounded by `HEARTBEAT_LOCK_WAIT_SEC` (default 5 s): a command then
+  command and hook of the session. The wait is bounded by `HEARTBEAT_LOCK_WAIT_SEC` (default 2 s, so that it ends before a short hook timeout does): a command then
   exits with status 2 and says the state is locked, a hook answers without breaking the host (`Stop` lets the turn end
   and says why), and a waiter tries again at its next poll.
 - After a channel fired, the `Stop` block named only the fired channels. When the agent then closed, extended or
