@@ -185,9 +185,13 @@ payload of a tool call made inside a subagent. If it equals the channel's agent,
 | `hook` | hook entry: JSON on stdin, JSON on stdout | `EVENT`: `PostToolUse`, `UserPromptSubmit` or `Stop` |
 | `mcp` | MCP server on stdio | none |
 
-`wait` prints what fired and exits with status 0. It also lists the channels that are still quiet and, when there are
-any, reminds the agent to start a waiter again. With nothing to wait for it says so (`heartbeat: no open channel to wait for`) and exits at
-once.
+`wait` prints the channels that fired, in full, and exits with status 0. For the channels that are still quiet it gives
+their number and the names of the first five, and, when there are any, reminds the agent to start a waiter again; the
+text stays small however many channels are open. With nothing to wait for it says so (`heartbeat: no open channel to
+wait for`) and exits at once.
+
+`open`, `extend`, `ack` and `close` end their output with the command that starts a waiter when open channels are left
+without one.
 
 ## MCP tools
 
@@ -197,7 +201,7 @@ the commands above; times are in minutes here.
 
 | Tool | Arguments (required in bold) | Does |
 | --- | --- | --- |
-| `heartbeat_open` | **`label`**, `name`, `minutes`, `every_minutes`, `notation`, `agent` | open a channel; one of `minutes` and `every_minutes` is required; the reply carries the waiter command when no waiter runs |
+| `heartbeat_open` | **`label`**, `name`, `minutes`, `every_minutes`, `notation`, `agent` | open a channel; one of `minutes` and `every_minutes` is required; the reply carries the waiter command when open channels are left without a waiter (so do the replies of `heartbeat_extend`, `heartbeat_ack` and `heartbeat_close`) |
 | `heartbeat_beat` | **`name`**, `text` | a sign of life |
 | `heartbeat_note` | **`name`**, **`text`** | ask for attention; the channel fires until acknowledged |
 | `heartbeat_finish` | **`name`**, `text` | report that the work is done; the channel fires until closed |
@@ -217,7 +221,7 @@ answers `{}`. A session that never opened a channel costs one `stat` call and ge
 | Hook | Behaviour |
 | --- | --- |
 | `PostToolUse`, `UserPromptSubmit` | If the call was made inside a subagent (the payload has `agent_id`): counts as a sign of life on the open channels bound to that agent, answers `{}`. Otherwise: if a channel has fired and was not mentioned during the last `HEARTBEAT_NAG_SEC`, adds all fired channels to the agent's context (`additionalContext`). If nothing fired but open channels have no waiter, adds a reminder naming the waiter command, at most once per `HEARTBEAT_ARM_NAG_SEC`. |
-| `Stop` | Refuses to end the turn (`decision: block`, with the reason shown to the agent) while a channel has fired, or while an open channel is not watched by a waiter. It never blocks twice in a row: when the payload has `stop_hook_active`, it answers `{}`. |
+| `Stop` | Refuses to end the turn (`decision: block`, with the reason shown to the agent) while a channel has fired, and also while an open channel is not watched by a waiter. The refusal for a fired channel names the unwatched open channels as well and says to start a waiter once the fired channels are handled. A payload with `stop_hook_active` (the turn continued because of a Stop hook) is not refused for a fired channel, but it is still refused for unwatched channels, at most `HEARTBEAT_STOP_UNWATCHED_MAX` times in a row: then the hook lets the turn end and says so in a `systemMessage`. Starting a waiter, or a Stop that does not block, resets that count. |
 
 Environment variables that tune the behaviour (a value that is not a number falls back to the default):
 
@@ -226,6 +230,7 @@ Environment variables that tune the behaviour (a value that is not a number fall
 | `HEARTBEAT_STATE_DIR` | `~/.local/state/heartbeat-mcp` | where the per-session state files live |
 | `HEARTBEAT_NAG_SEC` | `300` | a fired channel is repeated in the agent's context this often |
 | `HEARTBEAT_ARM_NAG_SEC` | `600` | the "channels are not covered by a waiter" reminder is repeated this often |
+| `HEARTBEAT_STOP_UNWATCHED_MAX` | `3` | how many times in a row `Stop` refuses because open channels have no waiter before it lets the turn end (a value that is not a whole number of zero or more falls back to the default) |
 | `HEARTBEAT_WAIT_POLL_SEC` | `15` | a waiter re-reads the state at least this often (it also wakes at the next deadline, and never sleeps less than one second) |
 | `CLAUDE_CODE_SESSION_ID` | set by the harness | the session the command belongs to |
 
@@ -233,12 +238,18 @@ Environment variables that tune the behaviour (a value that is not a number fall
 
 - One JSON file per session: `$HEARTBEAT_STATE_DIR/<session-uuid>.json`, in a directory with mode `0700`, file mode
   `0600`. It holds the channels (name, label, notation, deadline, interval, bound agent, status, beat count, notes,
-  finish text), the running waiters (process id and the channels each watches) and the time of the last reminder.
+  finish text), the running waiters (process id, process start time and the channels each watches), the time of the last reminder and
+  the number of `Stop` refusals in a row for unwatched channels.
 - Every operation, including `list` and each poll of a waiter, takes an exclusive `flock` on the state file for its
   whole read-modify-write, so the command line, the hooks, the MCP server and any number of waiters can run at once.
-- A waiter records its process id. A recorded waiter counts only while that process is alive and its command line
-  names this `heartbeat.py` (relative paths and symbolic links are resolved) and `wait`, so a reused process id does
-  not count.
+- A waiter records its process id and its process start time (field 22 of `/proc/<pid>/stat`). A recorded waiter counts
+  only while the process with that id has that start time, is not stopped, and was started as this `heartbeat.py`
+  (relative paths and symbolic links are resolved) with `wait` as the subcommand, not as any other argument. A reused
+  process id therefore does not count. A waiter that will exit on its next poll, because a channel it watches has
+  fired or it watches no open channel, does not count as watching the other channels. A waiter removes its own record
+  in the locked section in which it decides to exit, before it prints. Records of processes that are gone or are not
+  the recorded process are dropped when the state is next written; a stopped waiter stays, because it may be
+  continued.
 - Closed channels stay in the file for 24 hours, then they are dropped the next time a channel is closed. A closed
   channel's name can be opened again.
 - The session is, in order: the `--session` option or the hook payload's `session_id`; `CLAUDE_CODE_SESSION_ID`; the
@@ -278,7 +289,7 @@ can go idle, and when the waiter exits the host re-invokes it. The hooks cover t
 stop.
 
 **Does it need Claude Code?** The command line and the MCP server are plain programs. The hooks use Claude Code's hook
-format (`session_id`, `agent_id`, `stop_hook_active`, `decision`/`reason`, `hookSpecificOutput.additionalContext`), and
+format (`session_id`, `agent_id`, `stop_hook_active`, `decision`/`reason`, `systemMessage`, `hookSpecificOutput.additionalContext`), and
 the wake-up needs a host that re-invokes an idle agent when a background command exits.
 
 **What if I forget to start the waiter, or it dies?** The `Stop` hook refuses to end the turn and names the channels
@@ -286,8 +297,8 @@ that nothing watches, and the `PostToolUse` and `UserPromptSubmit` hooks remind 
 `NOT covered by a waiter: ...`.
 
 **The `Stop` hook keeps sending my agent back. How do I get out?** Look at each channel that fired, then `close` it,
-`extend` it or `ack` its notes. For channels without a waiter, start one. The hook blocks at most once per
-continuation, so it cannot loop.
+`extend` it or `ack` its notes. For channels without a waiter, start one. A fired channel is refused once per
+turn end, and unwatched channels at most `HEARTBEAT_STOP_UNWATCHED_MAX` times in a row, so the hook cannot loop.
 
 **Can two sessions, or two machines, share channels?** No. State is per session and per machine. A script on another
 machine has to signal through the machine that holds the state.

@@ -180,9 +180,11 @@ flowchart LR
 | `hook` | 훅 진입점: stdin에 JSON, stdout에 JSON | `EVENT`: `PostToolUse`, `UserPromptSubmit`, `Stop` |
 | `mcp` | stdio MCP 서버 | 없음 |
 
-`wait`는 울린 채널을 출력하고 종료 코드 0으로 끝납니다. 아직 조용한 채널도 함께 보여 주고, 그런 채널이 있으면 대기자를
-다시 시작하라고 알려 줍니다. 기다릴 것이 없으면 그 사실을 출력하고(`heartbeat: no open channel to wait for`) 바로
-끝납니다.
+`wait`는 울린 채널을 전부 출력하고 종료 코드 0으로 끝납니다. 아직 조용한 채널은 개수와 앞의 다섯 개 이름만 보여 주고,
+그런 채널이 있으면 대기자를 다시 시작하라고 알려 줍니다. 열린 채널이 아무리 많아도 출력은 작게 유지됩니다. 기다릴
+것이 없으면 그 사실을 출력하고(`heartbeat: no open channel to wait for`) 바로 끝납니다.
+
+`open`, `extend`, `ack`, `close`는 열린 채널이 대기자 없이 남으면 출력 끝에 대기자를 시작하는 명령을 덧붙입니다.
 
 ## MCP 도구
 
@@ -192,7 +194,7 @@ flowchart LR
 
 | 도구 | 인자(굵은 글씨는 필수) | 하는 일 |
 | --- | --- | --- |
-| `heartbeat_open` | **`label`**, `name`, `minutes`, `every_minutes`, `notation`, `agent` | 채널을 엶. `minutes`와 `every_minutes` 중 하나는 필수. 대기자가 없으면 응답에 대기자 명령이 들어 있음 |
+| `heartbeat_open` | **`label`**, `name`, `minutes`, `every_minutes`, `notation`, `agent` | 채널을 엶. `minutes`와 `every_minutes` 중 하나는 필수. 열린 채널이 대기자 없이 남으면 응답에 대기자 명령이 들어 있음(`heartbeat_extend`, `heartbeat_ack`, `heartbeat_close`의 응답도 같음) |
 | `heartbeat_beat` | **`name`**, `text` | 생존 신호 |
 | `heartbeat_note` | **`name`**, **`text`** | 주의를 요청함. 확인될 때까지 채널이 울림 |
 | `heartbeat_finish` | **`name`**, `text` | 작업이 끝났다고 보고함. 닫힐 때까지 채널이 울림 |
@@ -212,7 +214,7 @@ flowchart LR
 | 훅 | 동작 |
 | --- | --- |
 | `PostToolUse`, `UserPromptSubmit` | 호출이 서브에이전트 안에서 일어났다면(페이로드에 `agent_id`가 있음) 그 agent에 묶인 열린 채널의 생존 신호로 세고 `{}`를 답합니다. 그렇지 않으면, 울린 채널이 있고 최근 `HEARTBEAT_NAG_SEC` 동안 언급되지 않았다면 울린 채널 전부를 에이전트의 컨텍스트(`additionalContext`)에 추가합니다. 울린 것은 없는데 열린 채널에 대기자가 없으면, 대기자 명령을 알리는 문구를 `HEARTBEAT_ARM_NAG_SEC`에 한 번 이하로 추가합니다. |
-| `Stop` | 채널이 울렸거나 열린 채널을 지켜보는 대기자가 없는 동안 턴 종료를 막습니다(`decision: block`, 사유는 에이전트에게 보임). 연속으로 두 번 막지는 않습니다. 페이로드에 `stop_hook_active`가 있으면 `{}`로 답합니다. |
+| `Stop` | 채널이 울렸거나 열린 채널을 지켜보는 대기자가 없는 동안 턴 종료를 막습니다(`decision: block`, 사유는 에이전트에게 보임). 울린 채널 때문에 막을 때는 지켜보는 대기자가 없는 열린 채널도 함께 알리고, 울린 채널을 처리한 뒤 대기자를 시작하라고 안내합니다. 페이로드에 `stop_hook_active`가 있으면(Stop 훅 때문에 턴이 이어진 경우) 울린 채널 때문에는 막지 않지만, 지켜보는 대기자가 없는 채널 때문에는 연속으로 최대 `HEARTBEAT_STOP_UNWATCHED_MAX`번까지 계속 막습니다. 그 뒤에는 턴이 끝나도록 두고 `systemMessage`로 그 사실을 알립니다. 대기자를 시작하거나 막지 않은 Stop이 있으면 이 횟수는 0으로 돌아갑니다. |
 
 동작을 조절하는 환경 변수입니다(숫자가 아닌 값은 기본값으로 돌아갑니다).
 
@@ -221,6 +223,7 @@ flowchart LR
 | `HEARTBEAT_STATE_DIR` | `~/.local/state/heartbeat-mcp` | 세션별 상태 파일 위치 |
 | `HEARTBEAT_NAG_SEC` | `300` | 울린 채널을 에이전트 컨텍스트에서 반복하는 간격 |
 | `HEARTBEAT_ARM_NAG_SEC` | `600` | "채널을 지켜보는 대기자가 없음" 안내를 반복하는 간격 |
+| `HEARTBEAT_STOP_UNWATCHED_MAX` | `3` | 열린 채널에 대기자가 없다는 이유로 `Stop`이 연속으로 막는 최대 횟수. 그 뒤에는 턴이 끝나도록 둠(0 이상의 정수가 아니면 기본값) |
 | `HEARTBEAT_WAIT_POLL_SEC` | `15` | 대기자가 상태를 다시 읽는 최대 간격(다음 데드라인에도 깨며, 1초보다 짧게는 쉬지 않음) |
 | `CLAUDE_CODE_SESSION_ID` | 하네스가 설정 | 명령이 속한 세션 |
 
@@ -228,11 +231,17 @@ flowchart LR
 
 - 세션마다 JSON 파일 하나: `$HEARTBEAT_STATE_DIR/<세션-uuid>.json`. 디렉터리 권한은 `0700`, 파일 권한은 `0600`입니다.
   채널(이름, 레이블, 주석, 데드라인, 간격, 묶인 agent, 상태, beat 횟수, 메모, finish 문구), 실행 중인 대기자(프로세스
-  id와 각자 지켜보는 채널), 마지막 안내 시각이 들어 있습니다.
+  id, 프로세스 시작 시각, 각자 지켜보는 채널), 마지막 안내 시각, 지켜보는 대기자가 없다는 이유로 `Stop`이 연속으로 막은
+  횟수가 들어 있습니다.
 - `list`와 대기자의 매 폴링을 포함한 모든 연산이 읽고 쓰는 동안 상태 파일에 배타적 `flock`을 잡습니다. 그래서 명령줄,
   훅, MCP 서버, 여러 대기자가 동시에 돌아도 됩니다.
-- 대기자는 자신의 프로세스 id를 기록합니다. 기록된 대기자는 그 프로세스가 살아 있고 명령줄이 이 `heartbeat.py`(상대
-  경로와 심볼릭 링크는 해석함)와 `wait`를 가리킬 때만 유효하므로, 재사용된 프로세스 id는 인정되지 않습니다.
+- 대기자는 자신의 프로세스 id와 프로세스 시작 시각(`/proc/<pid>/stat`의 22번째 필드)을 기록합니다. 기록된 대기자는
+  그 id의 프로세스가 같은 시작 시각을 갖고, 멈춰 있지 않고, 이 `heartbeat.py`(상대 경로와 심볼릭 링크는 해석함)를 `wait`
+  하위 명령으로 실행한 것일 때만 유효합니다(`wait`가 다른 인자로 들어 있으면 안 됨). 그래서 재사용된 프로세스 id는
+  인정되지 않습니다. 다음 폴링에서 종료할 대기자, 즉 지켜보는 채널이 울렸거나 지켜볼 열린 채널이 없는 대기자는 다른
+  채널을 지켜보는 것으로 치지 않습니다. 대기자는 종료하기로 정한 같은 잠금 구간에서, 출력하기 전에 자기 기록을
+  지웁니다. 사라졌거나 기록된 프로세스가 아닌 항목은 다음에 상태를 쓸 때 지워지고, 멈춰 있는 대기자는 다시 이어질 수
+  있으므로 남습니다.
 - 닫힌 채널은 24시간 동안 파일에 남고, 그 뒤 다음에 채널을 닫을 때 지워집니다. 닫힌 채널의 이름은 다시 쓸 수 있습니다.
 - 세션은 다음 순서로 정해집니다. `--session` 옵션 또는 훅 페이로드의 `session_id`, `CLAUDE_CODE_SESSION_ID`, 그리고
   이런 파일을 가진 가장 가까운 조상 프로세스의 `~/.claude/sessions/<pid>.json`에 있는 `sessionId`(최대 16단계, `/proc`로
@@ -271,15 +280,15 @@ flowchart LR
 맡습니다.
 
 **Claude Code가 꼭 필요한가요?** 명령줄과 MCP 서버는 평범한 프로그램입니다. 훅은 Claude Code의 훅 형식(`session_id`,
-`agent_id`, `stop_hook_active`, `decision`/`reason`, `hookSpecificOutput.additionalContext`)을 쓰고, 깨우기에는 백그라운드
+`agent_id`, `stop_hook_active`, `decision`/`reason`, `systemMessage`, `hookSpecificOutput.additionalContext`)을 쓰고, 깨우기에는 백그라운드
 명령이 끝나면 쉬는 에이전트를 다시 호출하는 호스트가 필요합니다.
 
 **대기자를 시작하는 것을 잊거나 대기자가 죽으면요?** `Stop` 훅이 턴 종료를 막고 아무도 지켜보지 않는 채널을 알려 주며,
 `PostToolUse`, `UserPromptSubmit` 훅도 가끔 상기시킵니다. `list`는 `NOT covered by a waiter: ...`를 보여 줍니다.
 
 **`Stop` 훅이 에이전트를 계속 되돌려 보냅니다. 어떻게 빠져나오나요?** 울린 채널을 하나씩 살펴본 뒤 `close`하거나
-`extend`하거나 메모를 `ack`하세요. 대기자가 없는 채널에는 대기자를 시작하세요. 훅은 한 번의 이어짐(continuation)에 최대
-한 번만 막으므로 무한 반복은 없습니다.
+`extend`하거나 메모를 `ack`하세요. 대기자가 없는 채널에는 대기자를 시작하세요. 울린 채널은 턴을 끝내려 할 때마다 한 번 막고, 대기자가 없는
+채널은 연속으로 최대 `HEARTBEAT_STOP_UNWATCHED_MAX`번만 막으므로 무한 반복은 없습니다.
 
 **세션 둘, 혹은 기계 둘이 채널을 공유할 수 있나요?** 아니요. 상태는 세션별, 기계별입니다. 다른 기계의 스크립트는 상태를
 가진 기계를 거쳐 신호를 보내야 합니다.
