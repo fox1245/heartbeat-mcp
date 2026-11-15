@@ -438,6 +438,12 @@ with tempfile.TemporaryDirectory() as folder:
         check("the waiter is stopped", proc_stat(second.pid)[0] in "Tt", proc_stat(second.pid))
         answer = hook("Stop", penv, sid)
         check("a stopped waiter does not count", blocked(answer) and "not watched" in answer.get("reason", ""), answer)
+        os.kill(second.pid, signal.SIGCONT)
+        resumed_at = time.time()
+        while proc_stat(second.pid)[0] in "Tt" and time.time() - resumed_at < 10:
+            time.sleep(0.01)
+        check("a stopped waiter stays recorded and counts again once it continues",
+              hook("Stop", penv, sid) == {}, read_state(pfile)["waiters"])
     finally:
         end(second)
 
