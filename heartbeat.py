@@ -224,17 +224,55 @@ def describe(channel: dict, now: float) -> str:
     return text
 
 
-def _is_waiter(waiter: dict) -> bool:
-    """Whether a recorded waiter is still this program waiting (a reused pid of another program does not count)."""
+def process_stat(pid) -> tuple[str, int] | None:
+    """(state letter, start time in clock ticks since boot) of a process, or None when it cannot be read. The fields
+    are counted from the last ")" because the command name in the second field may hold spaces and parentheses."""
     try:
-        with open(f"/proc/{waiter['pid']}/cmdline", "rb") as handle:
+        with open(f"/proc/{int(pid)}/stat", "rb") as handle:
+            raw = handle.read()
+    except (OSError, ValueError, TypeError):
+        return None
+    after_command = raw.rpartition(b")")[2].split()
+    try:
+        return after_command[0].decode(), int(after_command[19])      # fields 3 (state) and 22 (starttime)
+    except (IndexError, ValueError):
+        return None
+
+
+def _subcommand(arguments: list[str], directory: str) -> str | None:
+    """The subcommand of an invocation of this program: the first word after its path that is not the global option
+    --session (in any spelling the argument parser accepts)."""
+    for index, argument in enumerate(arguments):
+        if argument and os.path.realpath(os.path.join(directory, argument)) == SELF:
+            break
+    else:
+        return None
+    following = arguments[index + 1:]
+    position = 0
+    while position < len(following):
+        word = following[position]
+        name, equals, _ = word.partition("=")
+        if word.startswith("--") and len(name) > 2 and "--session".startswith(name):
+            position += 1 if equals else 2
+            continue
+        return word
+    return None
+
+
+def _is_waiter(waiter: dict) -> bool:
+    """Whether a recorded waiter is still the process that recorded itself, running, and this program waiting (a
+    reused pid does not count: the process start time is compared with the one the waiter recorded)."""
+    stat = process_stat(waiter.get("pid"))
+    if stat is None or stat[0] in "TtZX" or waiter.get("start_ticks") is None or stat[1] != waiter["start_ticks"]:
+        return False                                  # not running, stopped, or another process with this pid
+    try:
+        with open(f"/proc/{int(waiter['pid'])}/cmdline", "rb") as handle:
             arguments = [os.fsdecode(argument) for argument in handle.read().split(b"\0")]
-        directory = os.readlink(f"/proc/{waiter['pid']}/cwd")
-    except (OSError, KeyError):
+        directory = os.readlink(f"/proc/{int(waiter['pid'])}/cwd")
+    except (OSError, ValueError):
         return False
     # The program may have been started by a relative path or through a symbolic link.
-    return "wait" in arguments and any(
-        os.path.realpath(os.path.join(directory, argument)) == SELF for argument in arguments if argument)
+    return _subcommand(arguments, directory) == "wait"
 
 
 def uncovered(data: dict) -> list[dict]:
@@ -383,7 +421,9 @@ def run_wait(sid: str, names: list[str] | None) -> int:
     with state(sid) as data:
         for name in names or []:
             _get(data, name)
-        data["waiters"].append({"pid": os.getpid(), "started": time.time(), "channels": names or None})
+        own = process_stat(os.getpid())
+        data["waiters"].append({"pid": os.getpid(), "started": time.time(), "start_ticks": own[1] if own else None,
+                                "channels": names or None})
     try:
         while True:
             now = time.time()
