@@ -48,6 +48,7 @@ STATE_DIR = os.environ.get("HEARTBEAT_STATE_DIR") or os.path.join(
 NAG_EVERY_SEC = _setting("HEARTBEAT_NAG_SEC", 300.0)          # a fired channel is repeated in context this often
 ARM_NAG_EVERY_SEC = _setting("HEARTBEAT_ARM_NAG_SEC", 600.0)  # "channels are not covered" is repeated this often
 WAIT_POLL_SEC = _setting("HEARTBEAT_WAIT_POLL_SEC", 15.0)     # a waiter re-reads the state this often
+WAIT_QUIET_NAMES_MAX = 5                                      # a waiter names at most this many quiet channels
 NAME_MAX = 64
 UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0}
 SELF = os.path.realpath(__file__)
@@ -121,9 +122,11 @@ def state(sid: str, write: bool = True):
         yield data
         if write:
             data["waiters"] = [waiter for waiter in data["waiters"] if _is_waiter(waiter)]
-            handle.seek(0)
-            handle.truncate()
-            json.dump(data, handle, indent=1)
+            text = json.dumps(data, indent=1)
+            if text != raw:                            # a waiter's quiet poll rewrites nothing
+                handle.seek(0)
+                handle.truncate()
+                handle.write(text)
 
 
 def parse_duration(text: str) -> float:
@@ -416,40 +419,55 @@ def render_list(listing: dict) -> str:
 # The waiter: a select over channels
 # ---------------------------------------------------------------------------------------------------------------------
 
+def _wait_report(hits: list[dict], quiet: list[dict], now: float) -> str:
+    """What a waiter says when it exits: the fired channels in full, the quiet ones as a count and a few names, so
+    the text stays small however many channels are open."""
+    lines = [f"HEARTBEAT: {len(hits)} channel(s) fired. Look at each now, then close it, extend it or "
+             f"acknowledge its notes:"]
+    lines += ["  " + describe(channel, now) for channel in hits]
+    if quiet:
+        more = len(quiet) - WAIT_QUIET_NAMES_MAX
+        lines.append(f"  quiet: {len(quiet)} channel(s) still open: " +
+                     ", ".join(channel["name"] for channel in quiet[:WAIT_QUIET_NAMES_MAX]) +
+                     (f" and {more} more" if more > 0 else ""))
+        lines.append("Start a waiter again afterwards: channels are still open.")
+    return "\n".join(lines)
+
+
 def run_wait(sid: str, names: list[str] | None) -> int:
-    """Blocks until one of the watched channels fires (every channel when none is named), then says which and why."""
+    """Blocks until one of the watched channels fires (every channel when none is named), then says which and why.
+    The waiter takes its decision to exit and removes itself from the state in one locked section, before it prints."""
+    own = process_stat(os.getpid())
     with state(sid) as data:
         for name in names or []:
             _get(data, name)
-        own = process_stat(os.getpid())
         data["waiters"].append({"pid": os.getpid(), "started": time.time(), "start_ticks": own[1] if own else None,
                                 "channels": names or None})
+    registered = True
     try:
         while True:
             now = time.time()
-            with state(sid, write=False) as data:
+            report = None
+            with state(sid) as data:
                 watched = [channel for channel in live(data) if not names or channel["name"] in names]
-                others = [channel for channel in live(data) if names and channel["name"] not in names]
-            if not watched:
-                print("heartbeat: no open channel to wait for")
+                hits = [channel for channel in watched if events_of(channel, now)]
+                if not watched:
+                    report = "heartbeat: no open channel to wait for"
+                elif hits:
+                    report = _wait_report(hits, [channel for channel in live(data) if not events_of(channel, now)], now)
+                else:
+                    next_due = min(channel["due"] for channel in watched if channel["status"] == OPEN)
+                if report is not None:
+                    data["waiters"] = [waiter for waiter in data["waiters"] if waiter.get("pid") != os.getpid()]
+                    registered = False
+            if report is not None:
+                print(report)
                 return 0
-            hits = [channel for channel in watched if events_of(channel, now)]
-            if hits:
-                print(f"HEARTBEAT: {len(hits)} channel(s) fired. Look at each now, then close it, extend it or "
-                      f"acknowledge its notes:")
-                for channel in hits:
-                    print("  " + describe(channel, now))
-                quiet = [channel for channel in watched + others if not events_of(channel, now)]
-                for channel in quiet:
-                    print("  quiet: " + describe(channel, now))
-                if quiet:
-                    print("Start a waiter again afterwards: channels are still open.")
-                return 0
-            next_due = min(channel["due"] for channel in watched if channel["status"] == OPEN)
             time.sleep(max(1.0, min(WAIT_POLL_SEC, next_due - now)))
     finally:
-        with state(sid) as data:
-            data["waiters"] = [waiter for waiter in data["waiters"] if waiter.get("pid") != os.getpid()]
+        if registered:                                 # an interrupt or an error: do not leave a record behind
+            with state(sid) as data:
+                data["waiters"] = [waiter for waiter in data["waiters"] if waiter.get("pid") != os.getpid()]
 
 
 # ---------------------------------------------------------------------------------------------------------------------
