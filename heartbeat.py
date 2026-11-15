@@ -43,11 +43,18 @@ def _setting(name: str, default: float) -> float:
         return default
 
 
+def _count_setting(name: str, default: int) -> int:
+    """A whole number of zero or more from the environment; anything else (a word, nan, a negative) is the default."""
+    value = _setting(name, float(default))
+    return int(value) if 0 <= value < 1e9 else default
+
+
 STATE_DIR = os.environ.get("HEARTBEAT_STATE_DIR") or os.path.join(
     os.path.expanduser("~"), ".local", "state", "heartbeat-mcp")
 NAG_EVERY_SEC = _setting("HEARTBEAT_NAG_SEC", 300.0)          # a fired channel is repeated in context this often
 ARM_NAG_EVERY_SEC = _setting("HEARTBEAT_ARM_NAG_SEC", 600.0)  # "channels are not covered" is repeated this often
 WAIT_POLL_SEC = _setting("HEARTBEAT_WAIT_POLL_SEC", 15.0)     # a waiter re-reads the state this often
+STOP_UNWATCHED_MAX = _count_setting("HEARTBEAT_STOP_UNWATCHED_MAX", 3)  # Stop refusals in a row for unwatched channels
 WAIT_QUIET_NAMES_MAX = 5                                      # a waiter names at most this many quiet channels
 NAME_MAX = 64
 UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0}
@@ -462,6 +469,7 @@ def run_wait(sid: str, names: list[str] | None) -> int:
             _get(data, name)
         data["waiters"].append({"pid": os.getpid(), "started": time.time(), "start_ticks": own[1] if own else None,
                                 "channels": names or None})
+        data["stop_unwatched_blocks"] = 0              # a waiter is running again: the Stop refusals start afresh
     registered = True
     try:
         while True:
@@ -518,9 +526,7 @@ def hook_answer(event: str, payload: dict) -> dict:
         hits = fired(data, now)
         bare = uncovered(data, now)
         if event == "Stop":
-            if payload.get("stop_hook_active"):
-                return {}                             # the turn already continued because of a Stop hook: no loop
-            if hits:
+            if hits and not payload.get("stop_hook_active"):
                 listing = "\n".join("  " + describe(channel, now) for channel in hits)
                 reason = ("Heartbeat: channels fired. Look at each one now (read the work's own output, "
                           "resume or stop its agent), then close it, extend it or acknowledge its notes:\n"
@@ -532,10 +538,19 @@ def hook_answer(event: str, payload: dict) -> dict:
                                f"channels are closed, extended or acknowledged. {ARM_HINT}")
                 return {"decision": "block", "reason": reason}
             if bare:
+                names = ", ".join(channel["name"] for channel in bare)
+                refused = int(data.get("stop_unwatched_blocks") or 0)
+                if refused >= STOP_UNWATCHED_MAX:
+                    # The agent was told this many times in a row and still has no waiter: let the turn end.
+                    data["stop_unwatched_blocks"] = 0
+                    return {"systemMessage": f"Heartbeat: {len(bare)} open channel(s) are not watched by a waiter "
+                                             f"({names}); the turn is allowed to end after {refused} refusals. "
+                                             f"Nothing will wake this session when one fires. {ARM_HINT}"}
+                data["stop_unwatched_blocks"] = refused + 1
                 return {"decision": "block",
-                        "reason": f"Heartbeat: {len(bare)} open channel(s) are not watched by a waiter "
-                                  f"({', '.join(channel['name'] for channel in bare)}), so nothing would wake this "
-                                  f"session when one fires. {ARM_HINT}"}
+                        "reason": f"Heartbeat: {len(bare)} open channel(s) are not watched by a waiter ({names}), "
+                                  f"so nothing would wake this session when one fires. {ARM_HINT}"}
+            data["stop_unwatched_blocks"] = 0
             return {}
         lines = []
         if any(now - channel.get("last_nag", 0.0) >= NAG_EVERY_SEC for channel in hits):
