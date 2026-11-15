@@ -29,9 +29,12 @@ def check(name, condition, detail=""):
         bad += 1
 
 
-def run(arguments, env, stdin=None):
-    done = subprocess.run([sys.executable, "-I", PROGRAM, *arguments], input=stdin, env=env,
-                          capture_output=True, text=True, timeout=30)
+def run(arguments, env, stdin=None, timeout=30):
+    try:
+        done = subprocess.run([sys.executable, "-I", PROGRAM, *arguments], input=stdin, env=env,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "", "timed out"
     return done.returncode, done.stdout.strip(), done.stderr.strip()
 
 
@@ -641,6 +644,49 @@ with tempfile.TemporaryDirectory() as folder:
     run(["close", "A"], penv)
     run(["close", "B"], penv)
     check("a continuation with nothing unwatched passes", continuation() == {})
+
+    # The state's lock has a bound: a process that holds it for ever must not stall every command and hook.
+    sid, penv, pfile = new_session(HEARTBEAT_LOCK_WAIT_SEC="0.5", HEARTBEAT_WAIT_POLL_SEC="1")
+    run(["open", "A", "--label", "first", "--in", "1h"], penv)
+    holding = subprocess.Popen(
+        [sys.executable, "-I", "-c", "import fcntl, sys; h = open(sys.argv[1]); fcntl.flock(h, fcntl.LOCK_EX); "
+         "print('locked', flush=True); sys.stdin.read()", pfile],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        check("a helper holds the state's lock", holding.stdout.readline().strip() == "locked")
+        began = time.time()
+        code, out, err = run(["list"], penv, timeout=8)
+        check("a command gives up on a locked state and says so",
+              code == 2 and "locked" in err and time.time() - began < 6, (code, err))
+        code, out, err = run(["hook", "PostToolUse"], penv, stdin=json.dumps({"session_id": sid}), timeout=8)
+        check("a hook that cannot read the state answers {}", code == 0 and out == "{}", (code, out, err))
+        code, out, err = run(["hook", "Stop"], penv, stdin=json.dumps({"session_id": sid}), timeout=8)
+        answer = json.loads(out) if out else {}
+        check("a Stop that cannot read the state lets the turn end and says why",
+              code == 0 and "decision" not in answer and "locked" in answer.get("systemMessage", ""), (code, out, err))
+        code, out, err = run(["mcp"], penv, timeout=8, stdin=json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "heartbeat_list", "arguments": {}}}) + "\n")
+        check("an MCP tool reports a locked state as a tool error",
+              code == 0 and '"isError": true' in out and "locked" in out, (code, out, err))
+    finally:
+        end(holding)
+    code, out, _ = run(["list"], penv)
+    check("the state works again once the lock is released", code == 0 and "[A] first" in out, out)
+
+    # A waiter that meets a locked state tries again at its next poll instead of exiting.
+    waiting = spawn(penv, "wait")
+    try:
+        registered(waiting, pfile)
+        with open(pfile) as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            time.sleep(1.8)                              # more than one poll and the lock bound
+            check("a waiter is still waiting after it met a locked state", waiting.poll() is None, waiting.poll())
+        run(["finish", "A"], penv)
+        output = waiting.communicate(timeout=20)[0].decode()
+        check("and wakes when a channel fires", waiting.returncode == 0 and "[A]" in output, (waiting.returncode, output))
+    finally:
+        end(waiting)
 
     # The session is found through an ancestor's session file when the environment does not name it.
     bare = dict(env)
